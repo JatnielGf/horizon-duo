@@ -20,6 +20,7 @@
 
 use std::time::{Duration, Instant};
 
+pub mod config;
 mod draw;
 mod functions;
 mod keys;

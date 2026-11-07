@@ -455,6 +455,8 @@ impl Loading {
             return;
         }
         horizon_client::profile::set_running(id);
+        // The new profile's own touch layout.
+        horizon_client::touch::config::reload();
         self.settings = Settings::load(&Game::options_path());
         horizon_client::lang::set(horizon_client::lang::Language::load(
             &[&self.menu.root],

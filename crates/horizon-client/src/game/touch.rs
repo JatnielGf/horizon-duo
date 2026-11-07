@@ -101,7 +101,12 @@ impl Game<'_> {
     pub(super) fn touch_layout(&self) -> Option<Layout> {
         let r = self.renderer.as_ref()?;
         let scale = self.window.as_ref()?.scale_factor();
-        Some(Layout::new(r.config.width, r.config.height, scale))
+        Some(Layout::with_config(
+            r.config.width,
+            r.config.height,
+            scale,
+            horizon_client::touch::config::current(),
+        ))
     }
 
     /// The held item is used over time, as food, potions, bows and shields are
@@ -595,7 +600,12 @@ impl Loading {
         let (Some(r), Some(window)) = (&self.renderer, &self.window) else {
             return Ok(());
         };
-        let layout = Layout::new(r.config.width, r.config.height, window.scale_factor());
+        let layout = Layout::with_config(
+            r.config.width,
+            r.config.height,
+            window.scale_factor(),
+            horizon_client::touch::config::current(),
+        );
         let scale = HudBatch::new([r.config.width, r.config.height]).scale;
         let p = (
             touch.location.x as f32 / scale,
