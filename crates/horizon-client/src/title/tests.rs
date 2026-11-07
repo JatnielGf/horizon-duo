@@ -890,3 +890,36 @@ fn a_typed_field_name_focuses_its_box_and_a_wrong_one_changes_nothing() {
     f.title.focus_field("name").unwrap();
     assert!(matches!(f.title.mode, Mode::Edit { focused: true, .. }));
 }
+
+#[test]
+fn choosing_a_profile_switches_only_where_the_menu_can() {
+    for live in [false, true] {
+        let mut f = Fixture::new();
+        let home = f.root.join("home");
+        let mut profiles = crate::profile::Profiles::load(&home);
+        let ana = profiles.create("Ana").unwrap();
+        f.title.profiles_root = home.clone();
+        f.title.live_profile_switch = live;
+        f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
+        let size = (480.0, 262.0);
+        // Tap the second row, then Use.
+        f.title.click(240.0, 58.0, size);
+        let use_button = f
+            .title
+            .buttons(size.0, size.1)
+            .into_iter()
+            .find(|b| b.id == crate::profile_screen::USE)
+            .unwrap();
+        assert!(use_button.enabled);
+        let (action, _) = f.title.click(use_button.x + 5.0, use_button.y + 5.0, size);
+        if live {
+            assert!(matches!(&action, Action::SwitchProfile { id } if *id == ana.id));
+            assert!(matches!(f.title.mode, Mode::Main));
+        } else {
+            assert!(matches!(action, Action::None));
+            assert!(matches!(f.title.mode, Mode::Profiles(_)));
+        }
+        // Either way the choice is kept for the next launch.
+        assert_eq!(crate::profile::Profiles::load(&home).active(), ana);
+    }
+}

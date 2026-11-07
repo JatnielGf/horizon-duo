@@ -124,12 +124,21 @@ pub enum Action {
     Connect {
         address: String,
     },
+    /// Move the running game into this profile (see `Title::live_profile_switch`).
+    SwitchProfile {
+        id: String,
+    },
 }
 pub struct Title {
     pub mode: Mode,
     /// Direct Connection's address, synchronized with `options.txt`'s `lastServer`.
     pub last_server: String,
     pub saves: PathBuf,
+    /// The game folder the profiles live in.
+    pub profiles_root: PathBuf,
+    /// Whether choosing a profile moves the running game into it (the startup
+    /// menu can) or only keeps the choice for the next launch.
+    pub live_profile_switch: bool,
     pub started: std::time::Instant,
     search: String,
     search_focused: bool,
@@ -233,6 +242,8 @@ impl Title {
             mode,
             last_server: String::new(),
             saves,
+            profiles_root: crate::logging::game_home(),
+            live_profile_switch: false,
             started: now,
             search: String::new(),
             search_focused: false,
@@ -1222,7 +1233,7 @@ impl Title {
                 Action::None
             }
             (Mode::Main, Some(8)) => {
-                let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
+                let profiles = crate::profile::Profiles::load(&self.profiles_root);
                 self.mode = Mode::Profiles(crate::profile_screen::Screen::list(
                     &profiles,
                     &crate::profile::running(),
@@ -1230,20 +1241,25 @@ impl Title {
                 Action::None
             }
             (Mode::Profiles(screen), hit) => {
-                let mut profiles = crate::profile::Profiles::load(&crate::logging::game_home());
-                match hit {
+                let mut profiles = crate::profile::Profiles::load(&self.profiles_root);
+                let outcome = match hit {
                     None => {
                         if let Some(row) = screen.row_at(x, y, (w, h)) {
                             screen.select(row);
                         }
+                        crate::profile_screen::Outcome::None
                     }
-                    Some(id) => match screen.click(id, &mut profiles) {
-                        crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
-                        // The choice is kept for the next launch; moving the
-                        // running game into it is a later change.
-                        crate::profile_screen::Outcome::Switch(_)
-                        | crate::profile_screen::Outcome::None => {}
-                    },
+                    Some(id) => screen.click(id, &mut profiles),
+                };
+                match outcome {
+                    crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
+                    // Without a live switch the choice is kept for the next launch.
+                    crate::profile_screen::Outcome::Switch(id) if self.live_profile_switch => {
+                        self.mode = Mode::Main;
+                        return Action::SwitchProfile { id };
+                    }
+                    crate::profile_screen::Outcome::Switch(_)
+                    | crate::profile_screen::Outcome::None => {}
                 }
                 Action::None
             }
@@ -1602,7 +1618,7 @@ impl Title {
             return;
         }
         if let Mode::Profiles(screen) = &mut self.mode {
-            let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
+            let profiles = crate::profile::Profiles::load(&self.profiles_root);
             if !screen.escape(&profiles) {
                 return;
             }

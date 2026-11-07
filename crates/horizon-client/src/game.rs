@@ -11433,6 +11433,8 @@ impl ApplicationHandler for Game<'_> {
                             self.connect_server(&address, &self.options.player_name())?
                         }
                         Action::None => {}
+                        // Only the startup menu moves the game into a profile.
+                        Action::SwitchProfile { .. } => {}
                     }
                 }
                 WindowEvent::MouseInput { .. } if self.title.is_some() => {}

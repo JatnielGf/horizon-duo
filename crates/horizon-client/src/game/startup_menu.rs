@@ -76,12 +76,17 @@ impl StartupMenu {
                 &self.root,
             );
             title.last_server = settings.file.string("lastServer");
+            title.live_profile_switch = true;
             self.title = Some(title);
         }
     }
 
     pub(super) fn handoff(&mut self, game: &mut Game<'_>) {
         game.title = self.title.take();
+        // Past the startup menu a profile can only be chosen for the next launch.
+        if let Some(title) = &mut game.title {
+            title.live_profile_switch = false;
+        }
         game.pending_entry = self.pending.take();
         game.cursor = self.cursor;
         game.modifiers = self.modifiers;
@@ -417,6 +422,7 @@ impl Loading {
             Action::Options => self.open_menu_options(Page::Main),
             Action::Accessibility => self.open_menu_options(Page::Accessibility),
             Action::Language => self.open_menu_options(Page::Language),
+            Action::SwitchProfile { id } => self.switch_profile(&id),
             action => {
                 let name = self
                     .options
@@ -426,6 +432,41 @@ impl Loading {
             }
         }
         self.save_menu_address();
+    }
+
+    /// Moves the running game into another profile's folder: its options, saves,
+    /// servers and resource packs replace the current ones, and the resources
+    /// load again. What changed in the profile being left stays in it.
+    fn switch_profile(&mut self, id: &str) {
+        if id == horizon_client::profile::running() {
+            return;
+        }
+        let profiles =
+            horizon_client::profile::Profiles::load(&horizon_client::logging::game_home());
+        let Some(profile) = profiles.list().into_iter().find(|p| p.id == id) else {
+            return;
+        };
+        self.save_menu_settings();
+        let dir = profiles.dir(&profile);
+        if let Err(error) =
+            std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir))
+        {
+            log::warn!("Horizon: profile {}: {error}", dir.display());
+            return;
+        }
+        horizon_client::profile::set_running(id);
+        self.settings = Settings::load(&Game::options_path());
+        horizon_client::lang::set(horizon_client::lang::Language::load(
+            &[&self.menu.root],
+            &self.settings.language,
+        ));
+        self.apply_menu_settings();
+        if let Some(title) = &mut self.menu.title {
+            title.saves = dir.join("saves");
+            title.last_server = self.settings.file.string("lastServer");
+        }
+        self.menu.options_open = false;
+        self.menu.reload_packs = true;
     }
 
     /// The startup menu's focused field: an options search box, or a title field.
