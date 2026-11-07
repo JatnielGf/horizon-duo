@@ -101,6 +101,8 @@ pub enum Mode {
         return_to: Box<Mode>,
     },
     Multiplayer(crate::multiplayer::Screen),
+    /// The profile picker (iOS: one game folder per player).
+    Profiles(crate::profile_screen::Screen),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -614,6 +616,9 @@ impl Title {
                     button.icon = Some((icon, size));
                     buttons.push(button);
                 }
+                // Profiles: its own screen, after the three icon buttons.
+                #[cfg(target_os = "ios")]
+                buttons.push(b(cx - 34.0 + 3.0 * 24.0, y + 72.0, 20.0, "P", true, 8));
                 buttons
             }
             Mode::Select { selected, .. } => vec![
@@ -759,6 +764,11 @@ impl Title {
             )],
             Mode::Backup { .. } => Vec::new(),
             Mode::Multiplayer(screen) => screen
+                .buttons(w, h)
+                .into_iter()
+                .map(|(x, y, bw, label, enabled, id)| b(x, y, bw, &label, enabled, id))
+                .collect(),
+            Mode::Profiles(screen) => screen
                 .buttons(w, h)
                 .into_iter()
                 .map(|(x, y, bw, label, enabled, id)| b(x, y, bw, &label, enabled, id))
@@ -1076,6 +1086,12 @@ impl Title {
                 (self.started.elapsed().as_millis() / 300).is_multiple_of(2),
                 cursor,
             ),
+            Mode::Profiles(screen) => screen.draw(
+                atlas,
+                batch,
+                (self.started.elapsed().as_millis() / 300).is_multiple_of(2),
+                (w, h),
+            ),
         }
         for b in self.buttons(w, h) {
             crate::widgets::record(&b.label, [b.x, b.y, b.w, 20.0], b.enabled);
@@ -1203,6 +1219,32 @@ impl Title {
             },
             (Mode::Main, Some(5)) => {
                 self.mode = Mode::Multiplayer(crate::multiplayer::Screen::friend());
+                Action::None
+            }
+            (Mode::Main, Some(8)) => {
+                let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
+                self.mode = Mode::Profiles(crate::profile_screen::Screen::list(
+                    &profiles,
+                    &crate::profile::running(),
+                ));
+                Action::None
+            }
+            (Mode::Profiles(screen), hit) => {
+                let mut profiles = crate::profile::Profiles::load(&crate::logging::game_home());
+                match hit {
+                    None => {
+                        if let Some(row) = screen.row_at(x, y, (w, h)) {
+                            screen.select(row);
+                        }
+                    }
+                    Some(id) => match screen.click(id, &mut profiles) {
+                        crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
+                        // The choice is kept for the next launch; moving the
+                        // running game into it is a later change.
+                        crate::profile_screen::Outcome::Switch(_)
+                        | crate::profile_screen::Outcome::None => {}
+                    },
+                }
                 Action::None
             }
             (Mode::Main, Some(3)) => Action::Options,
@@ -1375,6 +1417,7 @@ impl Title {
             Mode::Edit { focused, .. } => *focused,
             Mode::Create { focus, .. } => *focus < 2,
             Mode::Multiplayer(screen) => screen.typing(),
+            Mode::Profiles(screen) => screen.typing(),
             _ => false,
         }
     }
@@ -1402,10 +1445,16 @@ impl Title {
         if let Mode::Multiplayer(screen) = &mut self.mode {
             return screen.type_text(text);
         }
+        if let Mode::Profiles(screen) = &mut self.mode {
+            return screen.type_text(text);
+        }
         self.edit_field(|edit| edit.insert_text(text));
     }
     pub fn backspace(&mut self) {
         if let Mode::Multiplayer(screen) = &mut self.mode {
+            return screen.backspace();
+        }
+        if let Mode::Profiles(screen) = &mut self.mode {
             return screen.backspace();
         }
         self.field_key(winit::keyboard::KeyCode::Backspace, false, false);
@@ -1551,6 +1600,12 @@ impl Title {
             && !screen.escape(&self.saves)
         {
             return;
+        }
+        if let Mode::Profiles(screen) = &mut self.mode {
+            let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
+            if !screen.escape(&profiles) {
+                return;
+            }
         }
         match &self.mode {
             Mode::Backup { .. } => {}

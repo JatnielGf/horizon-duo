@@ -28,6 +28,19 @@ pub const DEFAULT_NAME: &str = "Default";
 pub const MAX_NAME_CHARS: usize = 32;
 const ID_PREFIX: &str = "profile-";
 
+/// The profile this run of the game is in (the built-in one until `main` enters
+/// another).
+static RUNNING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn set_running(id: &str) {
+    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = id.to_owned();
+}
+
+pub fn running() -> String {
+    let id = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if id.is_empty() { DEFAULT_ID.into() } else { id }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub id: String,
