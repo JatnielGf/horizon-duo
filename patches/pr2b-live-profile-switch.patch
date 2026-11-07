@@ -1,0 +1,237 @@
+From 7835afe5fc894a8ae05e8ad108abba85d86deb61 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 17:14:56 +0000
+Subject: [PATCH] Switch profiles from the startup menu without restarting
+
+Choosing a profile in the startup menu now moves the running game into it:
+the profile being left keeps its changed options, the working directory
+becomes the new profile's folder, options.txt is read again (language, GUI
+scale, window), the title's saves and last server follow, and the resource
+loader restarts with the new profile's packs. Past the startup menu the
+choice is still kept for the next launch.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game.rs             |  2 +
+ .../horizon-client/src/game/startup_menu.rs   | 41 +++++++++++++++++++
+ crates/horizon-client/src/title.rs            | 38 ++++++++++++-----
+ crates/horizon-client/src/title/tests.rs      | 33 +++++++++++++++
+ 4 files changed, 103 insertions(+), 11 deletions(-)
+
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 7cc62fc..7fa2628 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -11433,6 +11433,8 @@ impl ApplicationHandler for Game<'_> {
+                             self.connect_server(&address, &self.options.player_name())?
+                         }
+                         Action::None => {}
++                        // Only the startup menu moves the game into a profile.
++                        Action::SwitchProfile { .. } => {}
+                     }
+                 }
+                 WindowEvent::MouseInput { .. } if self.title.is_some() => {}
+diff --git a/crates/horizon-client/src/game/startup_menu.rs b/crates/horizon-client/src/game/startup_menu.rs
+index c0f833c..8d540eb 100644
+--- a/crates/horizon-client/src/game/startup_menu.rs
++++ b/crates/horizon-client/src/game/startup_menu.rs
+@@ -76,12 +76,17 @@ impl StartupMenu {
+                 &self.root,
+             );
+             title.last_server = settings.file.string("lastServer");
++            title.live_profile_switch = true;
+             self.title = Some(title);
+         }
+     }
+ 
+     pub(super) fn handoff(&mut self, game: &mut Game<'_>) {
+         game.title = self.title.take();
++        // Past the startup menu a profile can only be chosen for the next launch.
++        if let Some(title) = &mut game.title {
++            title.live_profile_switch = false;
++        }
+         game.pending_entry = self.pending.take();
+         game.cursor = self.cursor;
+         game.modifiers = self.modifiers;
+@@ -417,6 +422,7 @@ impl Loading {
+             Action::Options => self.open_menu_options(Page::Main),
+             Action::Accessibility => self.open_menu_options(Page::Accessibility),
+             Action::Language => self.open_menu_options(Page::Language),
++            Action::SwitchProfile { id } => self.switch_profile(&id),
+             action => {
+                 let name = self
+                     .options
+@@ -428,6 +434,41 @@ impl Loading {
+         self.save_menu_address();
+     }
+ 
++    /// Moves the running game into another profile's folder: its options, saves,
++    /// servers and resource packs replace the current ones, and the resources
++    /// load again. What changed in the profile being left stays in it.
++    fn switch_profile(&mut self, id: &str) {
++        if id == horizon_client::profile::running() {
++            return;
++        }
++        let profiles =
++            horizon_client::profile::Profiles::load(&horizon_client::logging::game_home());
++        let Some(profile) = profiles.list().into_iter().find(|p| p.id == id) else {
++            return;
++        };
++        self.save_menu_settings();
++        let dir = profiles.dir(&profile);
++        if let Err(error) =
++            std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir))
++        {
++            log::warn!("Horizon: profile {}: {error}", dir.display());
++            return;
++        }
++        horizon_client::profile::set_running(id);
++        self.settings = Settings::load(&Game::options_path());
++        horizon_client::lang::set(horizon_client::lang::Language::load(
++            &[&self.menu.root],
++            &self.settings.language,
++        ));
++        self.apply_menu_settings();
++        if let Some(title) = &mut self.menu.title {
++            title.saves = dir.join("saves");
++            title.last_server = self.settings.file.string("lastServer");
++        }
++        self.menu.options_open = false;
++        self.menu.reload_packs = true;
++    }
++
+     /// The startup menu's focused field: an options search box, or a title field.
+     pub(super) fn typing_field(&self) -> Option<Field> {
+         let menu = &self.menu;
+diff --git a/crates/horizon-client/src/title.rs b/crates/horizon-client/src/title.rs
+index 8cb4a11..27ab67d 100644
+--- a/crates/horizon-client/src/title.rs
++++ b/crates/horizon-client/src/title.rs
+@@ -124,12 +124,21 @@ pub enum Action {
+     Connect {
+         address: String,
+     },
++    /// Move the running game into this profile (see `Title::live_profile_switch`).
++    SwitchProfile {
++        id: String,
++    },
+ }
+ pub struct Title {
+     pub mode: Mode,
+     /// Direct Connection's address, synchronized with `options.txt`'s `lastServer`.
+     pub last_server: String,
+     pub saves: PathBuf,
++    /// The game folder the profiles live in.
++    pub profiles_root: PathBuf,
++    /// Whether choosing a profile moves the running game into it (the startup
++    /// menu can) or only keeps the choice for the next launch.
++    pub live_profile_switch: bool,
+     pub started: std::time::Instant,
+     search: String,
+     search_focused: bool,
+@@ -233,6 +242,8 @@ impl Title {
+             mode,
+             last_server: String::new(),
+             saves,
++            profiles_root: crate::logging::game_home(),
++            live_profile_switch: false,
+             started: now,
+             search: String::new(),
+             search_focused: false,
+@@ -1222,7 +1233,7 @@ impl Title {
+                 Action::None
+             }
+             (Mode::Main, Some(8)) => {
+-                let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++                let profiles = crate::profile::Profiles::load(&self.profiles_root);
+                 self.mode = Mode::Profiles(crate::profile_screen::Screen::list(
+                     &profiles,
+                     &crate::profile::running(),
+@@ -1230,20 +1241,25 @@ impl Title {
+                 Action::None
+             }
+             (Mode::Profiles(screen), hit) => {
+-                let mut profiles = crate::profile::Profiles::load(&crate::logging::game_home());
+-                match hit {
++                let mut profiles = crate::profile::Profiles::load(&self.profiles_root);
++                let outcome = match hit {
+                     None => {
+                         if let Some(row) = screen.row_at(x, y, (w, h)) {
+                             screen.select(row);
+                         }
++                        crate::profile_screen::Outcome::None
+                     }
+-                    Some(id) => match screen.click(id, &mut profiles) {
+-                        crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
+-                        // The choice is kept for the next launch; moving the
+-                        // running game into it is a later change.
+-                        crate::profile_screen::Outcome::Switch(_)
+-                        | crate::profile_screen::Outcome::None => {}
+-                    },
++                    Some(id) => screen.click(id, &mut profiles),
++                };
++                match outcome {
++                    crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
++                    // Without a live switch the choice is kept for the next launch.
++                    crate::profile_screen::Outcome::Switch(id) if self.live_profile_switch => {
++                        self.mode = Mode::Main;
++                        return Action::SwitchProfile { id };
++                    }
++                    crate::profile_screen::Outcome::Switch(_)
++                    | crate::profile_screen::Outcome::None => {}
+                 }
+                 Action::None
+             }
+@@ -1602,7 +1618,7 @@ impl Title {
+             return;
+         }
+         if let Mode::Profiles(screen) = &mut self.mode {
+-            let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++            let profiles = crate::profile::Profiles::load(&self.profiles_root);
+             if !screen.escape(&profiles) {
+                 return;
+             }
+diff --git a/crates/horizon-client/src/title/tests.rs b/crates/horizon-client/src/title/tests.rs
+index 357ab8a..023e95f 100644
+--- a/crates/horizon-client/src/title/tests.rs
++++ b/crates/horizon-client/src/title/tests.rs
+@@ -890,3 +890,36 @@ fn a_typed_field_name_focuses_its_box_and_a_wrong_one_changes_nothing() {
+     f.title.focus_field("name").unwrap();
+     assert!(matches!(f.title.mode, Mode::Edit { focused: true, .. }));
+ }
++
++#[test]
++fn choosing_a_profile_switches_only_where_the_menu_can() {
++    for live in [false, true] {
++        let mut f = Fixture::new();
++        let home = f.root.join("home");
++        let mut profiles = crate::profile::Profiles::load(&home);
++        let ana = profiles.create("Ana").unwrap();
++        f.title.profiles_root = home.clone();
++        f.title.live_profile_switch = live;
++        f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
++        let size = (480.0, 262.0);
++        // Tap the second row, then Use.
++        f.title.click(240.0, 58.0, size);
++        let use_button = f
++            .title
++            .buttons(size.0, size.1)
++            .into_iter()
++            .find(|b| b.id == crate::profile_screen::USE)
++            .unwrap();
++        assert!(use_button.enabled);
++        let (action, _) = f.title.click(use_button.x + 5.0, use_button.y + 5.0, size);
++        if live {
++            assert!(matches!(&action, Action::SwitchProfile { id } if *id == ana.id));
++            assert!(matches!(f.title.mode, Mode::Main));
++        } else {
++            assert!(matches!(action, Action::None));
++            assert!(matches!(f.title.mode, Mode::Profiles(_)));
++        }
++        // Either way the choice is kept for the next launch.
++        assert_eq!(crate::profile::Profiles::load(&home).active(), ana);
++    }
++}
+-- 
+2.43.0
+
