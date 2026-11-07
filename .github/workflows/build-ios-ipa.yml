@@ -1,7 +1,7 @@
 ```yaml
 name: Build Horizon iOS IPA
 
-on:
+"on":
   workflow_dispatch:
 
 permissions:
