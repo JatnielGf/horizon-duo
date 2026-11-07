@@ -1,0 +1,624 @@
+From baf8145e24fd5baacf02b465f16c89f6e9b03e57 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 17:08:49 +0000
+Subject: [PATCH] Show the profile picker from the title screen (iOS)
+
+A new Mode::Profiles screen, reached from a small "P" button next to the
+title's icon buttons (iOS only, so desktop layout is untouched). It lists
+the profiles, selects rows by tap, and creates, renames, deletes and picks
+the profile for the next launch. profile::running() tells the screen which
+profile this run is in, so the running one can't be deleted.
+
+Choosing a profile only records it for the next launch; moving the running
+game into it is the next change.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game/agent.rs     |   1 +
+ crates/horizon-client/src/main.rs           |  10 +-
+ crates/horizon-client/src/profile.rs        |  13 +
+ crates/horizon-client/src/profile_screen.rs | 274 ++++++++++++++++++--
+ crates/horizon-client/src/title.rs          |  55 ++++
+ 5 files changed, 330 insertions(+), 23 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/agent.rs b/crates/horizon-client/src/game/agent.rs
+index 163844f..72576fb 100644
+--- a/crates/horizon-client/src/game/agent.rs
++++ b/crates/horizon-client/src/game/agent.rs
+@@ -590,6 +590,7 @@ impl Game<'_> {
+                 json!({ "mode": "multiplayer", "disconnected": reason })
+             }
+             Mode::Multiplayer(_) => json!({ "mode": "multiplayer" }),
++            Mode::Profiles(_) => json!({ "mode": "profiles" }),
+         }
+     }
+ 
+diff --git a/crates/horizon-client/src/main.rs b/crates/horizon-client/src/main.rs
+index d85ef90..b68874c 100644
+--- a/crates/horizon-client/src/main.rs
++++ b/crates/horizon-client/src/main.rs
+@@ -23,10 +23,14 @@ fn main() {
+     // A profile other than the built-in one keeps its own options, saves and
+     // packs in a folder of its own; logs stay in `home`.
+     #[cfg(target_os = "ios")]
+-    if let Some(dir) = horizon_client::profile::Profiles::load(&home).active_dir()
+-        && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir))
+     {
+-        eprintln!("Horizon: {}: {e}", dir.display());
++        let profiles = horizon_client::profile::Profiles::load(&home);
++        if let Some(dir) = profiles.active_dir() {
++            match std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir)) {
++                Ok(()) => horizon_client::profile::set_running(&profiles.active().id),
++                Err(e) => eprintln!("Horizon: {}: {e}", dir.display()),
++            }
++        }
+     }
+     if !help {
+         logging::init(&home, thread);
+diff --git a/crates/horizon-client/src/profile.rs b/crates/horizon-client/src/profile.rs
+index f3b4327..d7e8365 100644
+--- a/crates/horizon-client/src/profile.rs
++++ b/crates/horizon-client/src/profile.rs
+@@ -28,6 +28,19 @@ pub const DEFAULT_NAME: &str = "Default";
+ pub const MAX_NAME_CHARS: usize = 32;
+ const ID_PREFIX: &str = "profile-";
+ 
++/// The profile this run of the game is in (the built-in one until `main` enters
++/// another).
++static RUNNING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
++
++pub fn set_running(id: &str) {
++    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = id.to_owned();
++}
++
++pub fn running() -> String {
++    let id = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).clone();
++    if id.is_empty() { DEFAULT_ID.into() } else { id }
++}
++
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct Profile {
+     pub id: String,
+diff --git a/crates/horizon-client/src/profile_screen.rs b/crates/horizon-client/src/profile_screen.rs
+index 05cd7ce..559b6a3 100644
+--- a/crates/horizon-client/src/profile_screen.rs
++++ b/crates/horizon-client/src/profile_screen.rs
+@@ -2,6 +2,7 @@
+ //! typed, the delete confirmation, and what each button asks for. It draws
+ //! nothing and starts nothing; the title screen shows it and acts on its
+ //! [`Outcome`], as it does for `multiplayer::Screen`.
++use crate::hud::{HudAtlas, HudBatch, rgba};
+ use crate::profile::{self, Profile, Profiles};
+ 
+ /// A button: x, y, width, label, enabled, id (the shape `multiplayer` uses).
+@@ -16,6 +17,13 @@ pub const SAVE: u8 = 5;
+ pub const CANCEL: u8 = 6;
+ pub const CONFIRM: u8 = 7;
+ 
++/// The list's rows: where it starts and how tall each is.
++const LIST_TOP: f32 = 36.0;
++const ROW_HEIGHT: f32 = 20.0;
++/// The space under the list: the message line and the buttons.
++const LIST_BOTTOM_GAP: f32 = 142.0;
++const ROW_WIDTH: f32 = 200.0;
++
+ /// What a click asks the title screen to do.
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum Outcome {
+@@ -27,13 +35,15 @@ pub enum Outcome {
+     Switch(String),
+ }
+ 
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub enum Screen {
+     List {
+         profiles: Vec<Profile>,
+         selected: usize,
+-        /// The id of the profile the game is in.
+-        current: String,
++        /// The profile this run of the game is in.
++        running: String,
++        /// The profile the game starts in (the one chosen with Use).
++        active: String,
+         /// Why the last button did nothing (a folder that could not be made).
+         error: Option<String>,
+     },
+@@ -42,22 +52,27 @@ pub enum Screen {
+         id: Option<String>,
+         name: String,
+         error: Option<String>,
++        running: String,
+     },
+     ConfirmDelete {
+         id: String,
+         name: String,
++        running: String,
+     },
+ }
+ 
+ impl Screen {
+-    /// The picker, with the profile the game is in selected.
+-    pub fn list(profiles: &Profiles, current: &str) -> Self {
++    /// The picker, with the profile the game starts in selected. `running` is
++    /// the profile this run is in.
++    pub fn list(profiles: &Profiles, running: &str) -> Self {
+         let all = profiles.list();
+-        let selected = all.iter().position(|p| p.id == current).unwrap_or(0);
++        let active = profiles.active().id;
++        let selected = all.iter().position(|p| p.id == active).unwrap_or(0);
+         Self::List {
+             profiles: all,
+             selected,
+-            current: current.to_owned(),
++            running: running.to_owned(),
++            active,
+             error: None,
+         }
+     }
+@@ -71,12 +86,14 @@ impl Screen {
+             Self::List {
+                 profiles,
+                 selected,
+-                current,
++                running,
++                active,
+                 ..
+             } => {
+                 let chosen = profiles.get(*selected);
+                 let custom = chosen.is_some_and(|p| !p.is_default());
+-                let in_use = chosen.is_some_and(|p| p.id == *current);
++                let in_use = chosen.is_some_and(|p| p.id == *active);
++                let busy = chosen.is_some_and(|p| p.id == *active || p.id == *running);
+                 vec![
+                     (
+                         x,
+@@ -93,7 +110,7 @@ impl Screen {
+                         bottom - 48.0,
+                         98.0,
+                         text("Delete"),
+-                        custom && !in_use,
++                        custom && !busy,
+                         DELETE,
+                     ),
+                     (x, bottom - 24.0, 200.0, text("Back"), true, BACK),
+@@ -136,20 +153,22 @@ impl Screen {
+                 Self::List {
+                     profiles: all,
+                     selected,
+-                    current,
++                    active,
+                     error,
++                    ..
+                 },
+                 USE,
+             ) => {
+                 let Some(target) = all.get(*selected).cloned() else {
+                     return Outcome::None;
+                 };
+-                if target.id == *current {
++                if target.id == *active {
+                     return Outcome::None;
+                 }
+                 match profiles.set_active(&target.id) {
+                     Ok(()) => {
+-                        *current = target.id.clone();
++                        *active = target.id.clone();
++                        *error = None;
+                         Outcome::Switch(target.id)
+                     }
+                     Err(e) => {
+@@ -158,11 +177,12 @@ impl Screen {
+                     }
+                 }
+             }
+-            (Self::List { .. }, NEW) => {
++            (Self::List { running, .. }, NEW) => {
+                 *self = Self::Edit {
+                     id: None,
+                     name: String::new(),
+                     error: None,
++                    running: running.clone(),
+                 };
+                 Outcome::None
+             }
+@@ -170,6 +190,7 @@ impl Screen {
+                 Self::List {
+                     profiles: all,
+                     selected,
++                    running,
+                     ..
+                 },
+                 RENAME,
+@@ -179,6 +200,7 @@ impl Screen {
+                         id: Some(p.id.clone()),
+                         name: p.name.clone(),
+                         error: None,
++                        running: running.clone(),
+                     };
+                 }
+                 Outcome::None
+@@ -187,23 +209,30 @@ impl Screen {
+                 Self::List {
+                     profiles: all,
+                     selected,
+-                    current,
++                    running,
++                    active,
+                     ..
+                 },
+                 DELETE,
+             ) => {
+                 if let Some(p) = all
+                     .get(*selected)
+-                    .filter(|p| !p.is_default() && p.id != *current)
++                    .filter(|p| !p.is_default() && p.id != *active && p.id != *running)
+                 {
+                     *self = Self::ConfirmDelete {
+                         id: p.id.clone(),
+                         name: p.name.clone(),
++                        running: running.clone(),
+                     };
+                 }
+                 Outcome::None
+             }
+-            (Self::Edit { id, name, error }, SAVE) => {
++            (
++                Self::Edit {
++                    id, name, error, ..
++                },
++                SAVE,
++            ) => {
+                 let saved = match id {
+                     Some(id) => profiles.rename(id, name),
+                     None => profiles.create(name).map(|_| ()),
+@@ -273,10 +302,153 @@ impl Screen {
+         }
+     }
+ 
+-    /// Back to the list, with the current profile selected again.
++    /// How many rows the list shows in a window `h` tall.
++    fn capacity(h: f32) -> usize {
++        (((h - LIST_BOTTOM_GAP - LIST_TOP) / ROW_HEIGHT)
++            .floor()
++            .max(1.0)) as usize
++    }
++
++    /// The first row shown, so that the selected one is in view.
++    pub fn first_visible(selected: usize, capacity: usize, len: usize) -> usize {
++        let first = (selected + 1).saturating_sub(capacity);
++        first.min(len.saturating_sub(capacity))
++    }
++
++    /// The row under a click at (`x`, `y`), in a window of `w` by `h`.
++    pub fn row_at(&self, x: f32, y: f32, (w, h): (f32, f32)) -> Option<usize> {
++        let Self::List {
++            profiles, selected, ..
++        } = self
++        else {
++            return None;
++        };
++        let left = (w / 2.0).floor() - ROW_WIDTH / 2.0;
++        let capacity = Self::capacity(h);
++        let first = Self::first_visible(*selected, capacity, profiles.len());
++        if x < left || x >= left + ROW_WIDTH || y < LIST_TOP {
++            return None;
++        }
++        let row = ((y - LIST_TOP) / ROW_HEIGHT) as usize;
++        (row < capacity && first + row < profiles.len()).then_some(first + row)
++    }
++
++    /// Draws the picker over the title's panorama; the buttons are drawn by the
++    /// title, from [`Screen::buttons`].
++    pub fn draw(&self, atlas: &HudAtlas, batch: &mut HudBatch, blink: bool, (w, h): (f32, f32)) {
++        let cx = (w / 2.0).floor();
++        let left = cx - ROW_WIDTH / 2.0;
++        let white = u32::MAX;
++        let gray = rgba(160, 160, 160, 255);
++        let red = rgba(255, 85, 85, 255);
++        let centered = |batch: &mut HudBatch, text: &str, y: f32, color: u32| {
++            let width = HudBatch::text_width(atlas, text).ceil();
++            batch.text(atlas, text, cx - (width / 2.0).floor(), y, color, true);
++        };
++        match self {
++            Self::List {
++                profiles,
++                selected,
++                running,
++                active,
++                error,
++            } => {
++                centered(batch, "Profiles", 14.0, white);
++                let capacity = Self::capacity(h);
++                let first = Self::first_visible(*selected, capacity, profiles.len());
++                for (row, profile) in profiles.iter().skip(first).take(capacity).enumerate() {
++                    let y = LIST_TOP + row as f32 * ROW_HEIGHT;
++                    batch.fill(
++                        atlas,
++                        left,
++                        y,
++                        ROW_WIDTH,
++                        ROW_HEIGHT - 2.0,
++                        rgba(0, 0, 0, 140),
++                    );
++                    if first + row == *selected {
++                        for (x, y, w, h) in [
++                            (left, y, ROW_WIDTH, 1.0),
++                            (left, y + ROW_HEIGHT - 3.0, ROW_WIDTH, 1.0),
++                            (left, y, 1.0, ROW_HEIGHT - 2.0),
++                            (left + ROW_WIDTH - 1.0, y, 1.0, ROW_HEIGHT - 2.0),
++                        ] {
++                            batch.fill(atlas, x, y, w, h, white);
++                        }
++                    }
++                    batch.text(atlas, &profile.name, left + 6.0, y + 5.0, white, true);
++                    let note = if profile.id == *active && active == running {
++                        Some("in use")
++                    } else if profile.id == *active {
++                        Some("next launch")
++                    } else if profile.id == *running {
++                        Some("running")
++                    } else {
++                        None
++                    };
++                    if let Some(note) = note {
++                        let width = HudBatch::text_width(atlas, note).ceil();
++                        batch.text(
++                            atlas,
++                            note,
++                            left + ROW_WIDTH - 6.0 - width,
++                            y + 5.0,
++                            gray,
++                            true,
++                        );
++                    }
++                }
++                if let Some(error) = error {
++                    centered(batch, error, h - LIST_BOTTOM_GAP + 4.0, red);
++                }
++            }
++            Self::Edit {
++                id, name, error, ..
++            } => {
++                centered(
++                    batch,
++                    if id.is_some() {
++                        "New name"
++                    } else {
++                        "New profile"
++                    },
++                    36.0,
++                    white,
++                );
++                batch.fill(atlas, left, 50.0, ROW_WIDTH, ROW_HEIGHT, white);
++                batch.fill(
++                    atlas,
++                    left + 1.0,
++                    51.0,
++                    ROW_WIDTH - 2.0,
++                    ROW_HEIGHT - 2.0,
++                    rgba(0, 0, 0, 255),
++                );
++                batch.text(atlas, name, left + 5.0, 56.0, white, true);
++                if blink {
++                    let caret = left + 5.0 + HudBatch::text_width(atlas, name).ceil();
++                    batch.fill(atlas, caret, 55.0, 1.0, 10.0, white);
++                }
++                if let Some(error) = error {
++                    centered(batch, error, 80.0, red);
++                }
++            }
++            Self::ConfirmDelete { name, .. } => {
++                centered(batch, "Delete this profile?", 50.0, white);
++                centered(batch, name, 66.0, white);
++                centered(batch, "Its worlds and settings will be lost.", 82.0, gray);
++            }
++        }
++    }
++
++    /// Back to the list, with the profile the game starts in selected.
+     fn back_to_list(&mut self, profiles: &Profiles) {
+-        let current = profiles.active().id;
+-        *self = Self::list(profiles, &current);
++        let running = match self {
++            Self::List { running, .. }
++            | Self::Edit { running, .. }
++            | Self::ConfirmDelete { running, .. } => running.clone(),
++        };
++        *self = Self::list(profiles, &running);
+     }
+ }
+ 
+@@ -309,6 +481,68 @@ mod tests {
+             .is_some_and(|b| b.4)
+     }
+ 
++    #[test]
++    fn the_list_scrolls_to_keep_the_selected_row_in_view() {
++        assert_eq!(Screen::first_visible(0, 5, 3), 0);
++        assert_eq!(Screen::first_visible(4, 5, 12), 0);
++        assert_eq!(Screen::first_visible(5, 5, 12), 1);
++        assert_eq!(Screen::first_visible(11, 5, 12), 7);
++        assert_eq!(Screen::first_visible(0, 5, 0), 0);
++    }
++
++    #[test]
++    fn rows_are_found_from_a_click() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        profiles.create("Ana").unwrap();
++        let screen = Screen::list(&profiles, "default");
++        let size = (800.0, 600.0);
++        assert_eq!(screen.row_at(400.0, LIST_TOP + 2.0, size), Some(0));
++        assert_eq!(
++            screen.row_at(400.0, LIST_TOP + ROW_HEIGHT + 2.0, size),
++            Some(1)
++        );
++        assert_eq!(
++            screen.row_at(400.0, LIST_TOP + 2.0 * ROW_HEIGHT + 2.0, size),
++            None
++        );
++        assert_eq!(
++            screen.row_at(10.0, LIST_TOP + 2.0, size),
++            None,
++            "left of the rows"
++        );
++        assert_eq!(screen.row_at(400.0, 5.0, size), None, "above the rows");
++    }
++
++    #[test]
++    fn a_chosen_profile_applies_at_the_next_launch_and_cannot_be_deleted_while_running() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let ana = profiles.create("Ana").unwrap();
++        // The game runs in Ana; the next launch is the built-in profile.
++        let mut screen = Screen::list(&profiles, &ana.id);
++        screen.select(1);
++        assert!(!enabled(&screen, DELETE), "the running profile stays");
++        assert!(enabled(&screen, USE), "chosen for the next launch");
++        assert_eq!(
++            screen.click(USE, &mut profiles),
++            Outcome::Switch(ana.id.clone())
++        );
++        assert!(!enabled(&screen, USE));
++        // Choosing the built-in profile again.
++        screen.select(0);
++        assert_eq!(
++            screen.click(USE, &mut profiles),
++            Outcome::Switch("default".into())
++        );
++        assert!(Profiles::load(&root).active().is_default());
++        // Still running in Ana: it can't be deleted until the game moves out.
++        screen.select(1);
++        assert!(!enabled(&screen, DELETE));
++        screen.click(DELETE, &mut profiles);
++        assert!(matches!(screen, Screen::List { .. }));
++    }
++
+     fn type_name(screen: &mut Screen, text: &str) {
+         screen.type_text(text);
+     }
+diff --git a/crates/horizon-client/src/title.rs b/crates/horizon-client/src/title.rs
+index 609637d..8cb4a11 100644
+--- a/crates/horizon-client/src/title.rs
++++ b/crates/horizon-client/src/title.rs
+@@ -101,6 +101,8 @@ pub enum Mode {
+         return_to: Box<Mode>,
+     },
+     Multiplayer(crate::multiplayer::Screen),
++    /// The profile picker (iOS: one game folder per player).
++    Profiles(crate::profile_screen::Screen),
+ }
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum Action {
+@@ -614,6 +616,9 @@ impl Title {
+                     button.icon = Some((icon, size));
+                     buttons.push(button);
+                 }
++                // Profiles: its own screen, after the three icon buttons.
++                #[cfg(target_os = "ios")]
++                buttons.push(b(cx - 34.0 + 3.0 * 24.0, y + 72.0, 20.0, "P", true, 8));
+                 buttons
+             }
+             Mode::Select { selected, .. } => vec![
+@@ -763,6 +768,11 @@ impl Title {
+                 .into_iter()
+                 .map(|(x, y, bw, label, enabled, id)| b(x, y, bw, &label, enabled, id))
+                 .collect(),
++            Mode::Profiles(screen) => screen
++                .buttons(w, h)
++                .into_iter()
++                .map(|(x, y, bw, label, enabled, id)| b(x, y, bw, &label, enabled, id))
++                .collect(),
+         }
+     }
+     pub fn draw(
+@@ -1076,6 +1086,12 @@ impl Title {
+                 (self.started.elapsed().as_millis() / 300).is_multiple_of(2),
+                 cursor,
+             ),
++            Mode::Profiles(screen) => screen.draw(
++                atlas,
++                batch,
++                (self.started.elapsed().as_millis() / 300).is_multiple_of(2),
++                (w, h),
++            ),
+         }
+         for b in self.buttons(w, h) {
+             crate::widgets::record(&b.label, [b.x, b.y, b.w, 20.0], b.enabled);
+@@ -1205,6 +1221,32 @@ impl Title {
+                 self.mode = Mode::Multiplayer(crate::multiplayer::Screen::friend());
+                 Action::None
+             }
++            (Mode::Main, Some(8)) => {
++                let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++                self.mode = Mode::Profiles(crate::profile_screen::Screen::list(
++                    &profiles,
++                    &crate::profile::running(),
++                ));
++                Action::None
++            }
++            (Mode::Profiles(screen), hit) => {
++                let mut profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++                match hit {
++                    None => {
++                        if let Some(row) = screen.row_at(x, y, (w, h)) {
++                            screen.select(row);
++                        }
++                    }
++                    Some(id) => match screen.click(id, &mut profiles) {
++                        crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
++                        // The choice is kept for the next launch; moving the
++                        // running game into it is a later change.
++                        crate::profile_screen::Outcome::Switch(_)
++                        | crate::profile_screen::Outcome::None => {}
++                    },
++                }
++                Action::None
++            }
+             (Mode::Main, Some(3)) => Action::Options,
+             (Mode::Main, Some(7)) => Action::Accessibility,
+             (Mode::Main, Some(6)) => Action::Language,
+@@ -1375,6 +1417,7 @@ impl Title {
+             Mode::Edit { focused, .. } => *focused,
+             Mode::Create { focus, .. } => *focus < 2,
+             Mode::Multiplayer(screen) => screen.typing(),
++            Mode::Profiles(screen) => screen.typing(),
+             _ => false,
+         }
+     }
+@@ -1402,12 +1445,18 @@ impl Title {
+         if let Mode::Multiplayer(screen) = &mut self.mode {
+             return screen.type_text(text);
+         }
++        if let Mode::Profiles(screen) = &mut self.mode {
++            return screen.type_text(text);
++        }
+         self.edit_field(|edit| edit.insert_text(text));
+     }
+     pub fn backspace(&mut self) {
+         if let Mode::Multiplayer(screen) = &mut self.mode {
+             return screen.backspace();
+         }
++        if let Mode::Profiles(screen) = &mut self.mode {
++            return screen.backspace();
++        }
+         self.field_key(winit::keyboard::KeyCode::Backspace, false, false);
+     }
+     /// EditBox.keyPressed: moving and deleting in the focused field.
+@@ -1552,6 +1601,12 @@ impl Title {
+         {
+             return;
+         }
++        if let Mode::Profiles(screen) = &mut self.mode {
++            let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++            if !screen.escape(&profiles) {
++                return;
++            }
++        }
+         match &self.mode {
+             Mode::Backup { .. } => {}
+             Mode::Edit { world, .. } | Mode::Delete { world } => {
+-- 
+2.43.0
+
