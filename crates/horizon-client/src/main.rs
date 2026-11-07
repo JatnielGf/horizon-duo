@@ -20,6 +20,14 @@ fn main() {
     if let Err(e) = std::fs::create_dir_all(&home).and_then(|()| std::env::set_current_dir(&home)) {
         eprintln!("Horizon: {}: {e}", home.display());
     }
+    // A profile other than the built-in one keeps its own options, saves and
+    // packs in a folder of its own; logs stay in `home`.
+    #[cfg(target_os = "ios")]
+    if let Some(dir) = horizon_client::profile::Profiles::load(&home).active_dir()
+        && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir))
+    {
+        eprintln!("Horizon: {}: {e}", dir.display());
+    }
     if !help {
         logging::init(&home, thread);
         crash::install(home.clone(), side);
