@@ -1,3 +1,4 @@
+```yaml
 name: Build Horizon iOS IPA
 
 on:
@@ -34,8 +35,32 @@ jobs:
 
           mkdir -p .local/horizon-client
 
-          unzip -q "$RUNNER_TEMP/horizon-resources/26.3.zip" \
-            -d .local/horizon-client
+          python3 - "$RUNNER_TEMP/horizon-resources/26.3.zip" ".local/horizon-client" <<'PY'
+          import sys
+          import zipfile
+          import shutil
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+
+          with zipfile.ZipFile(archive) as z:
+              for info in z.infolist():
+                  name = info.filename.replace("\\", "/")
+                  path = PurePosixPath(name)
+
+                  if path.is_absolute() or ".." in path.parts:
+                      raise RuntimeError(f"Ruta no válida en ZIP: {name}")
+
+                  target = destination.joinpath(*path.parts)
+
+                  if info.is_dir() or name.endswith("/"):
+                      target.mkdir(parents=True, exist_ok=True)
+                  else:
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with z.open(info) as source, target.open("wb") as output:
+                          shutil.copyfileobj(source, output)
+          PY
 
           test -f .local/horizon-client/26.3/horizon-resources.json
 
@@ -57,3 +82,4 @@ jobs:
           path: .local/ios/device/Horizon.ipa
           if-no-files-found: error
           retention-days: 7
+```
