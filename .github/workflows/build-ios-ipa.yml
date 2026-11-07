@@ -1,4 +1,3 @@
-```yaml
 name: Build Horizon iOS IPA
 
 on:
@@ -11,4 +10,3 @@ jobs:
     steps:
       - name: Confirm workflow works
         run: echo "GitHub Actions funciona correctamente"
-```
