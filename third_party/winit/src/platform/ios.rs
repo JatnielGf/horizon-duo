@@ -128,6 +128,14 @@ pub trait WindowExtIOS {
     /// This only has an effect on iOS 11.0+.
     fn set_prefers_home_indicator_hidden(&self, hidden: bool);
 
+    /// The parts of the [`Window`] that the notch, the rounded corners, the status bar or the
+    /// home indicator can cover, in physical pixels from each edge of the view.
+    ///
+    /// This is [`-[UIView safeAreaInsets]`](https://developer.apple.com/documentation/uikit/uiview/2891103-safeareainsets?language=objc)
+    /// of the window's view, rounded up to whole pixels. It changes when the device rotates, so
+    /// ask again after a `Resized`.
+    fn safe_area_insets(&self) -> SafeAreaInsets;
+
     /// Sets the screen edges for which the system gestures will take a lower priority than the
     /// application's touch handling.
     ///
@@ -194,6 +202,16 @@ pub trait WindowExtIOS {
     fn recognize_rotation_gesture(&self, should_recognize: bool);
 }
 
+/// How far the notch, the rounded corners and the system bars reach into the window, in
+/// physical pixels from each edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SafeAreaInsets {
+    pub top: u32,
+    pub left: u32,
+    pub bottom: u32,
+    pub right: u32,
+}
+
 impl WindowExtIOS for Window {
     #[inline]
     fn set_scale_factor(&self, scale_factor: f64) {
@@ -208,6 +226,11 @@ impl WindowExtIOS for Window {
     #[inline]
     fn set_prefers_home_indicator_hidden(&self, hidden: bool) {
         self.window.maybe_queue_on_main(move |w| w.set_prefers_home_indicator_hidden(hidden))
+    }
+
+    #[inline]
+    fn safe_area_insets(&self) -> SafeAreaInsets {
+        self.window.maybe_wait_on_main(|w| w.safe_area_insets())
     }
 
     #[inline]

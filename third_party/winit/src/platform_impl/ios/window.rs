@@ -193,6 +193,19 @@ impl Inner {
         size.to_physical(scale_factor)
     }
 
+    /// `safeAreaInsets` of the view, in physical pixels (zero where nothing covers it).
+    pub fn safe_area_insets(&self) -> crate::platform::ios::SafeAreaInsets {
+        let scale = self.scale_factor();
+        let insets = self.view.safeAreaInsets();
+        let pixels = |points: f64| (points.max(0.0) * scale).ceil() as u32;
+        crate::platform::ios::SafeAreaInsets {
+            top: pixels(insets.top as f64),
+            left: pixels(insets.left as f64),
+            bottom: pixels(insets.bottom as f64),
+            right: pixels(insets.right as f64),
+        }
+    }
+
     pub fn outer_size(&self) -> PhysicalSize<u32> {
         let scale_factor = self.scale_factor();
         let screen_frame = self.screen_frame();
