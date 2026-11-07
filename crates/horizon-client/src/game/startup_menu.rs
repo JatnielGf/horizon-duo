@@ -479,8 +479,14 @@ impl Loading {
         } else {
             menu.title
                 .as_ref()
-                .is_some_and(Title::typing)
-                .then_some(Field::Title)
+                .filter(|title| title.typing())
+                .map(|title| {
+                    if title.editing_profile() {
+                        Field::Profile
+                    } else {
+                        Field::Title
+                    }
+                })
         }
     }
 
@@ -500,7 +506,7 @@ impl Loading {
                 let events = self.menu.options.key(&mut self.settings, atlas, key, None);
                 self.menu_option_events(events);
             }
-            Field::Title => {
+            Field::Title | Field::Profile => {
                 match edit {
                     Edit::Text(text) => self.menu.title_edit(Some(&text), false),
                     Edit::Backspace => self.menu.title_edit(None, true),

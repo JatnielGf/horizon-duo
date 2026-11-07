@@ -923,3 +923,60 @@ fn choosing_a_profile_switches_only_where_the_menu_can() {
         assert_eq!(crate::profile::Profiles::load(&home).active(), ana);
     }
 }
+
+#[test]
+fn the_profile_name_box_takes_typing_backspace_and_enter() {
+    let mut f = Fixture::new();
+    let home = f.root.join("home");
+    let profiles = crate::profile::Profiles::load(&home);
+    f.title.profiles_root = home.clone();
+    f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
+    assert!(!f.title.editing_profile(), "the list takes no typing");
+    let size = (480.0, 262.0);
+    let new = f
+        .title
+        .buttons(size.0, size.1)
+        .into_iter()
+        .find(|b| b.id == crate::profile_screen::NEW)
+        .unwrap();
+    f.title.click(new.x + 5.0, new.y + 5.0, size);
+    // New opens the name box: the game asks the system keyboard for it.
+    assert!(f.title.editing_profile());
+    assert!(f.title.typing());
+    f.title.type_text("Anaa");
+    f.title.backspace();
+    assert!(matches!(
+        &f.title.mode,
+        Mode::Profiles(crate::profile_screen::Screen::Edit { name, .. }) if name == "Ana"
+    ));
+    // Enter saves it and the box closes, so the keyboard goes.
+    f.title.confirm_edit();
+    assert!(!f.title.editing_profile());
+    let saved = crate::profile::Profiles::load(&home).list();
+    assert_eq!(saved.len(), 2);
+    assert_eq!(saved[1].name, "Ana");
+}
+
+#[test]
+fn cancelling_the_profile_name_box_closes_it_without_saving() {
+    let mut f = Fixture::new();
+    let home = f.root.join("home");
+    let profiles = crate::profile::Profiles::load(&home);
+    f.title.profiles_root = home.clone();
+    f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
+    let size = (480.0, 262.0);
+    let press = |f: &mut Fixture, id: u8| {
+        let b = f
+            .title
+            .buttons(size.0, size.1)
+            .into_iter()
+            .find(|b| b.id == id)
+            .unwrap();
+        f.title.click(b.x + 5.0, b.y + 5.0, size);
+    };
+    press(&mut f, crate::profile_screen::NEW);
+    f.title.type_text("Beto");
+    press(&mut f, crate::profile_screen::CANCEL);
+    assert!(!f.title.editing_profile());
+    assert_eq!(crate::profile::Profiles::load(&home).list().len(), 1);
+}

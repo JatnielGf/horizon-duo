@@ -28,6 +28,8 @@ pub(super) enum Field {
     Options,
     /// The title screens' fields: world names and seeds, the world search, server addresses.
     Title,
+    /// The profile picker's name box: a screen made for typing, so the keyboard opens with it.
+    Profile,
 }
 
 impl Field {
@@ -36,7 +38,7 @@ impl Field {
     fn opens_keyboard(self) -> bool {
         matches!(
             self,
-            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock
+            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock | Field::Profile
         )
     }
     /// Enter ends the typing here; on a sign or a book's page it starts the next line.
@@ -202,7 +204,13 @@ impl Game<'_> {
             Screen::Win => None,
             Screen::CommandBlock => Some(Field::CommandBlock),
             Screen::Options => Some(Field::Options),
-            _ => self.title.is_some().then_some(Field::Title),
+            _ => self.title.as_ref().map(|title| {
+                if title.editing_profile() {
+                    Field::Profile
+                } else {
+                    Field::Title
+                }
+            }),
         }
     }
 
@@ -213,6 +221,7 @@ impl Game<'_> {
             Field::WorldOptions => self.world_options_typing(),
             Field::Options => self.ui.options.typing(),
             Field::Title => self.title.as_ref().is_some_and(|t| t.typing()),
+            Field::Profile => true,
             _ => true,
         };
         focused.then_some(field)
@@ -276,6 +285,14 @@ impl Game<'_> {
                 }
                 _ => self.title_edit(text, backspace),
             },
+            Field::Profile => match &edit {
+                Edit::Enter => {
+                    if let Some(title) = self.title.as_mut() {
+                        title.confirm_edit();
+                    }
+                }
+                _ => self.title_edit(text, backspace),
+            },
         }
     }
 
@@ -296,6 +313,12 @@ impl Game<'_> {
                 self.options_shortcut(all);
             }
             Field::Title => self.title_shortcut(all),
+            Field::Profile => {
+                if let Some(title) = self.title.as_mut() {
+                    title.profile_clear();
+                }
+                return;
+            }
         }
         self.edit_field(field, Edit::Backspace);
     }
@@ -387,6 +410,37 @@ mod tests {
     }
 
     #[test]
+    fn the_profile_name_box_opens_the_keyboard_with_its_screen_and_closes_it_after() {
+        let mut keyboard = SystemKeyboard::default();
+        // Tapping New opens the screen: the keyboard comes up without a tap on the box.
+        assert_eq!(keyboard.step(None), None);
+        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
+        assert_eq!(keyboard.step(Some(Field::Profile)), None);
+        // What it types reaches the box, and Enter saves (it ends the typing).
+        let typed = keyboard.input(Some(Field::Profile), SystemInput::Typed(Some("A")));
+        assert_eq!(typed, Some((Field::Profile, Edit::Text("A".into()))));
+        let enter = keyboard.input(Some(Field::Profile), SystemInput::Typed(Some("\n")));
+        assert_eq!(enter, Some((Field::Profile, Edit::Enter)));
+        // Saving or cancelling leaves the box: the keyboard goes.
+        assert_eq!(keyboard.step(None), Some(false));
+        // Back in the box, it comes up again.
+        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
+    }
+
+    #[test]
+    fn a_keyboard_put_away_comes_back_with_a_tap_on_the_name_box() {
+        let mut keyboard = SystemKeyboard::default();
+        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
+        // The iPad's hide key gives it up; only a tap asks again.
+        assert_eq!(
+            keyboard.input(Some(Field::Profile), SystemInput::Shown(false)),
+            None
+        );
+        assert_eq!(keyboard.step(Some(Field::Profile)), None);
+        assert_eq!(keyboard.request(Some(Field::Profile)), Some(true));
+    }
+
+    #[test]
     fn a_field_focused_without_a_tap_waits_for_one() {
         let mut keyboard = SystemKeyboard::default();
         assert_eq!(keyboard.step(Some(Field::CreativeSearch)), None);
@@ -447,6 +501,7 @@ mod tests {
             (WorldOptions, false, false),
             (Options, false, false),
             (Title, false, false),
+            (Profile, true, false),
         ];
         for (field, opens, keeps) in policies {
             assert_eq!(

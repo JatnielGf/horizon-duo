@@ -296,6 +296,13 @@ impl Screen {
         }
     }
 
+    /// Empties the name being typed.
+    pub fn clear_name(&mut self) {
+        if let Some(name) = self.name_mut() {
+            name.clear();
+        }
+    }
+
     pub fn backspace(&mut self) {
         if let Some(name) = self.name_mut() {
             name.pop();
@@ -414,6 +421,11 @@ impl Screen {
                     },
                     36.0,
                     white,
+                );
+                // A text field for the touch layer: a tap on it asks for the keyboard.
+                crate::widgets::target_as(
+                    [left, 50.0, ROW_WIDTH, ROW_HEIGHT],
+                    crate::widgets::Kind::Field,
                 );
                 batch.fill(atlas, left, 50.0, ROW_WIDTH, ROW_HEIGHT, white);
                 batch.fill(

@@ -1427,6 +1427,18 @@ impl Title {
         }
     }
     /// A text field has the focus: typed text goes to it.
+    /// The profile picker's name box is open: the system keyboard comes up with it.
+    pub fn editing_profile(&self) -> bool {
+        matches!(&self.mode, Mode::Profiles(screen) if screen.typing())
+    }
+
+    /// Empties the profile's name box.
+    pub fn profile_clear(&mut self) {
+        if let Mode::Profiles(screen) = &mut self.mode {
+            screen.clear_name();
+        }
+    }
+
     pub fn typing(&self) -> bool {
         match &self.mode {
             Mode::Select { .. } => self.search_focused,
@@ -1543,6 +1555,14 @@ impl Title {
         }
     }
     pub fn confirm_edit(&mut self) {
+        // Enter in the profile's name box saves it, as its Save button does.
+        if let Mode::Profiles(screen) = &mut self.mode {
+            if screen.typing() {
+                let mut profiles = crate::profile::Profiles::load(&self.profiles_root);
+                screen.click(crate::profile_screen::SAVE, &mut profiles);
+            }
+            return;
+        }
         let Mode::Edit {
             world,
             name,
