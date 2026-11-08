@@ -1,0 +1,395 @@
+From 95bdac91e3fd1c0bfe1fd9f8e9be36db1cf7b6bd Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sun, 8 Nov 2026 04:41:39 +0000
+Subject: [PATCH] Play under the running profile's name
+
+A profile's name was only a label in profiles.json. The name a server sees comes
+from Options::player_name, which never looked at profiles: it read the offline
+name kept in horizon-player.txt, generated once as Player + 5 digits. So a
+profile called "Ana" joined as Player5480.
+
+The running profile's name is now the player's name (below --name, the
+environment and a signed-in account, which still win), read from the index each
+time so a rename or a profile switch counts at once. The built-in profile keeps
+its generated offline name as before. A profile name is a name a player can have
+in Minecraft (1 to 16 printable characters, no spaces), so the name box checks
+it as it is typed; profiles named before this keep working and play under the
+nearest valid name.
+
+A generated name that can't be written to disk is now the same name every time
+it is asked for in a run, instead of a new one on each join.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game.rs           |  26 ++--
+ crates/horizon-client/src/offline_name.rs   |  45 ++++++-
+ crates/horizon-client/src/profile.rs        | 132 ++++++++++++++++++--
+ crates/horizon-client/src/profile_screen.rs |  24 +++-
+ 4 files changed, 202 insertions(+), 25 deletions(-)
+
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 7fa2628..f98caba 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -304,7 +304,7 @@ struct Options {
+     /// Multiplayer: `--server HOST[:PORT]` joins at start; `--name` is the offline player name.
+     server: Option<String>,
+     /// `--name`, `HORIZON_PLAYER_NAME` or the signed-in account's name; else
+-    /// [`Options::player_name`] uses the kept offline name.
++    /// [`Options::player_name`] uses the running profile's name, or the kept offline name.
+     player_name: Option<String>,
+     /// `--dedicated`: run as a dedicated server; vanilla's server arguments
+     /// (`--nogui`, `--port`, `--world`, `--universe`, `--initSettings`) follow.
+@@ -321,15 +321,23 @@ struct Options {
+     integrated: bool,
+ }
+ impl Options {
+-    /// The name to join servers with: the one given, else the offline name kept
+-    /// next to options.txt (created on first use).
++    /// The name to join servers with: the one given, else the running profile's name (a profile
++    /// is a player), else the offline name kept next to options.txt (created on first use), which
++    /// the built-in profile keeps playing under.
+     fn player_name(&self) -> String {
+-        self.player_name.clone().unwrap_or_else(|| {
+-            std::env::current_dir().map_or_else(
+-                |_| horizon_client::offline_name::generate(0),
+-                |dir| horizon_client::offline_name::load_or_create(&dir),
+-            )
+-        })
++        self.player_name
++            .clone()
++            .or_else(|| {
++                horizon_client::profile::Profiles::running_player_name(
++                    &horizon_client::logging::game_home(),
++                )
++            })
++            .unwrap_or_else(|| {
++                std::env::current_dir().map_or_else(
++                    |_| horizon_client::offline_name::generate(0),
++                    |dir| horizon_client::offline_name::load_or_create(&dir),
++                )
++            })
+     }
+     fn read() -> Result<Option<Self>> {
+         // codesign takes an iOS app's `resources` for a macOS bundle's Resources and refuses it.
+diff --git a/crates/horizon-client/src/offline_name.rs b/crates/horizon-client/src/offline_name.rs
+index 552f155..bb23cd1 100644
+--- a/crates/horizon-client/src/offline_name.rs
++++ b/crates/horizon-client/src/offline_name.rs
+@@ -7,7 +7,12 @@
+ //! refused with "You logged in from another location". The generated name is
+ //! kept in `horizon-player.txt` next to `options.txt` so the same player gets
+ //! the same offline UUID (and inventory on a friend's world) every time.
+-use std::{fs, path::Path};
++use std::{
++    collections::BTreeMap,
++    fs,
++    path::{Path, PathBuf},
++    sync::{Mutex, PoisonError},
++};
+ 
+ pub const FILE: &str = "horizon-player.txt";
+ const KEY: &str = "name:";
+@@ -23,14 +28,25 @@ pub fn generate(seed: u64) -> String {
+     format!("Player{:05}", seed % 100_000)
+ }
+ 
++/// The names this run made, by folder: one that couldn't be written is still the same name the
++/// next time it is asked for, not a new one each time.
++static MADE: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
++
+ /// The name kept in `dir`, created on first use. A file that can't be written
+-/// still yields a name for this run.
++/// still yields a name for this run, the same one every time.
+ pub fn load_or_create(dir: &Path) -> String {
+     let path = dir.join(FILE);
+     if let Some(name) = fs::read_to_string(&path).ok().and_then(|text| parse(&text)) {
+         return name;
+     }
++    let mut made = MADE.lock().unwrap_or_else(PoisonError::into_inner);
++    if let Some(name) = made.get(dir) {
++        // Another try at keeping it, in case the folder is writable now.
++        let _ = fs::write(&path, format!("{KEY}{name}\n"));
++        return name.clone();
++    }
+     let name = generate(seed());
++    made.insert(dir.to_owned(), name.clone());
+     if let Err(e) = fs::write(&path, format!("{KEY}{name}\n")) {
+         log::warn!(
+             "Horizon: could not keep the player name in {}: {e}",
+@@ -119,4 +135,29 @@ mod tests {
+             let _ = fs::remove_dir_all(&d);
+         }
+     }
++
++    #[test]
++    fn a_name_that_cannot_be_kept_is_still_the_same_name_each_time() {
++        // No such folder: nothing can be written there.
++        let nowhere = std::env::temp_dir().join(format!(
++            "horizon-offline-name-nowhere-{}/missing",
++            std::process::id()
++        ));
++        let first = load_or_create(&nowhere);
++        assert!(is_valid(&first));
++        for _ in 0..5 {
++            assert_eq!(load_or_create(&nowhere), first);
++        }
++    }
++
++    #[test]
++    fn a_name_kept_in_a_folder_is_read_back_by_the_next_run() {
++        let d = dir("kept");
++        let first = load_or_create(&d);
++        assert_eq!(
++            fs::read_to_string(d.join(FILE)).unwrap(),
++            format!("name:{first}\n")
++        );
++        assert_eq!(load_or_create(&d), first);
++    }
+ }
+diff --git a/crates/horizon-client/src/profile.rs b/crates/horizon-client/src/profile.rs
+index d7e8365..0784dba 100644
+--- a/crates/horizon-client/src/profile.rs
++++ b/crates/horizon-client/src/profile.rs
+@@ -6,6 +6,12 @@
+ //! entering a profile is just `set_current_dir(profile folder)` before the game
+ //! starts (see `main.rs`). Nothing else needs to know about profiles.
+ //!
++//! A profile's name is also the player's name in the game: a server sees it, and a world keeps the
++//! player's inventory under the UUID made from it (`offline_name` explains why every player needs
++//! a name of their own). So it follows Minecraft's rules for a name, and it is the only place the
++//! name of a profile is kept. The built-in profile has no name of its own: it keeps the offline
++//! name `offline_name` generates once into its game folder, as before.
++//!
+ //! The built-in `default` profile *is* the game folder itself. A device with no
+ //! `profiles.json`, or with `default` active, keeps every file where it was:
+ //! there is nothing to migrate and nothing to move. The other profiles live in
+@@ -24,8 +30,10 @@ pub const DIR: &str = "profiles";
+ /// The built-in profile: the game folder itself.
+ pub const DEFAULT_ID: &str = "default";
+ pub const DEFAULT_NAME: &str = "Default";
+-/// The longest name, in characters.
+-pub const MAX_NAME_CHARS: usize = 32;
++/// The longest name, in characters: Minecraft's limit for a player's name.
++pub const MAX_NAME_CHARS: usize = 16;
++/// What an index written before names were players' names may hold.
++const MAX_STORED_NAME_CHARS: usize = 32;
+ const ID_PREFIX: &str = "profile-";
+ 
+ /// The profile this run of the game is in (the built-in one until `main` enters
+@@ -87,12 +95,39 @@ fn is_extra_id(id: &str) -> bool {
+     })
+ }
+ 
+-/// The name as kept: trimmed, with 1 to `MAX_NAME_CHARS` printable characters.
++/// The name as kept: trimmed, and a name a player can have in Minecraft (1 to 16 printable
++/// characters, no spaces: `offline_name::is_valid`).
+ pub fn clean_name(name: &str) -> Option<String> {
+     let name = name.trim();
++    crate::offline_name::is_valid(name).then(|| name.to_owned())
++}
++
++/// A name an index may hold: profiles made when any short label was allowed keep working.
++fn is_stored_name(name: &str) -> bool {
+     let chars = name.chars().count();
+-    ((1..=MAX_NAME_CHARS).contains(&chars) && !name.chars().any(char::is_control))
+-        .then(|| name.to_owned())
++    name == name.trim()
++        && (1..=MAX_STORED_NAME_CHARS).contains(&chars)
++        && !name.chars().any(char::is_control)
++}
++
++/// The name `profile` plays under: its own when it is a Minecraft name, else the nearest one
++/// (spaces and other characters a name can't have become `_`, and the name is cut to 16
++/// characters). A name with nothing left of it is `Player` and the profile's number.
++pub fn player_name(profile: &Profile) -> String {
++    if crate::offline_name::is_valid(&profile.name) {
++        return profile.name.clone();
++    }
++    let name: String = profile
++        .name
++        .chars()
++        .map(|c| if c.is_ascii_graphic() { c } else { '_' })
++        .take(MAX_NAME_CHARS)
++        .collect();
++    if name.chars().any(|c| c != '_') {
++        return name;
++    }
++    let number = profile.id.strip_prefix(ID_PREFIX).unwrap_or("0");
++    format!("Player{number}")
+ }
+ 
+ impl Profiles {
+@@ -106,9 +141,7 @@ impl Profiles {
+             .unwrap_or_default();
+         let mut seen = Vec::new();
+         index.profiles.retain(|p| {
+-            let keep = is_extra_id(&p.id)
+-                && clean_name(&p.name).is_some_and(|n| n == p.name)
+-                && !seen.contains(&p.id);
++            let keep = is_extra_id(&p.id) && is_stored_name(&p.name) && !seen.contains(&p.id);
+             if keep {
+                 seen.push(p.id.clone());
+             }
+@@ -153,6 +186,22 @@ impl Profiles {
+         }
+     }
+ 
++    /// The name the profile with this id plays under, or `None` for the built-in one (it keeps
++    /// its offline name) and for an id that is not in the index.
++    pub fn player_name_of(&self, id: &str) -> Option<String> {
++        self.index
++            .profiles
++            .iter()
++            .find(|p| p.id == id)
++            .map(player_name)
++    }
++
++    /// The name this run of the game plays under when the player has not given one: the running
++    /// profile's, as the index has it now (a rename counts at once).
++    pub fn running_player_name(root: &Path) -> Option<String> {
++        Self::load(root).player_name_of(&running())
++    }
++
+     /// The folder to enter before the game starts, or `None` when the game
+     /// stays in its own folder (no extra profile is active).
+     pub fn active_dir(&self) -> Option<PathBuf> {
+@@ -163,8 +212,9 @@ impl Profiles {
+     /// A new profile, with its folder, saved in the index. The name is only a
+     /// label: it never becomes a path.
+     pub fn create(&mut self, name: &str) -> io::Result<Profile> {
+-        let name =
+-            clean_name(name).ok_or_else(|| invalid("the name must be 1 to 32 characters"))?;
++        let name = clean_name(name).ok_or_else(|| {
++            invalid("the name must be 1 to 16 letters, numbers or symbols, without spaces")
++        })?;
+         if self.name_taken(&name, None) {
+             return Err(invalid("there is already a profile with that name"));
+         }
+@@ -186,8 +236,9 @@ impl Profiles {
+ 
+     /// Gives a profile another name. The built-in one keeps its own.
+     pub fn rename(&mut self, id: &str, name: &str) -> io::Result<()> {
+-        let name =
+-            clean_name(name).ok_or_else(|| invalid("the name must be 1 to 32 characters"))?;
++        let name = clean_name(name).ok_or_else(|| {
++            invalid("the name must be 1 to 16 letters, numbers or symbols, without spaces")
++        })?;
+         if self.name_taken(&name, Some(id)) {
+             return Err(invalid("there is already a profile with that name"));
+         }
+@@ -397,6 +448,63 @@ mod tests {
+         assert!(profiles.active().is_default());
+     }
+ 
++    #[test]
++    fn a_profile_plays_under_its_own_name() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let ana = profiles.create("Ana").unwrap();
++        assert_eq!(profiles.player_name_of(&ana.id).as_deref(), Some("Ana"));
++        // The built-in profile keeps its generated offline name, and an unknown id has none.
++        assert_eq!(profiles.player_name_of(DEFAULT_ID), None);
++        assert_eq!(profiles.player_name_of("profile-9"), None);
++        // A rename counts at once, and after a restart.
++        profiles.rename(&ana.id, "Anita").unwrap();
++        assert_eq!(profiles.player_name_of(&ana.id).as_deref(), Some("Anita"));
++        let again = Profiles::load(&root);
++        assert_eq!(again.player_name_of(&ana.id).as_deref(), Some("Anita"));
++        // Another profile is another player.
++        let beto = profiles.create("Beto").unwrap();
++        assert_ne!(
++            profiles.player_name_of(&beto.id),
++            profiles.player_name_of(&ana.id)
++        );
++    }
++
++    #[test]
++    fn a_name_is_a_name_a_player_can_have() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        assert!(profiles.create("Ana Maria").is_err(), "no spaces");
++        assert!(profiles.create("\u{f1}and\u{fa}").is_err(), "no accents");
++        assert!(profiles.create("Ana_01").is_ok());
++        assert!(profiles.create(&"x".repeat(17)).is_err(), "16 at most");
++    }
++
++    #[test]
++    fn an_old_label_that_is_not_a_player_name_plays_under_the_nearest_one() {
++        let root = temp_root();
++        let index = r#"{"profiles": [
++            {"id": "profile-1", "name": "Ana Maria"},
++            {"id": "profile-2", "name": "\u65e5\u672c\u8a9e"},
++            {"id": "profile-3", "name": "A very long profile name"},
++            {"id": "profile-4", "name": "Beto"}
++        ]}"#;
++        fs::write(root.join(INDEX_FILE), index).unwrap();
++        let profiles = Profiles::load(&root);
++        // None is dropped, and each keeps a valid name, the same every time.
++        assert_eq!(profiles.list().len(), 5);
++        for (id, expected) in [
++            ("profile-1", "Ana_Maria"),
++            ("profile-2", "Player2"),
++            ("profile-3", "A_very_long_prof"),
++            ("profile-4", "Beto"),
++        ] {
++            let name = profiles.player_name_of(id).unwrap();
++            assert_eq!(name, expected, "{id}");
++            assert!(crate::offline_name::is_valid(&name), "{name}");
++        }
++    }
++
+     #[test]
+     fn a_missing_active_profile_is_unset() {
+         let root = temp_root();
+diff --git a/crates/horizon-client/src/profile_screen.rs b/crates/horizon-client/src/profile_screen.rs
+index 397c6ec..f4def57 100644
+--- a/crates/horizon-client/src/profile_screen.rs
++++ b/crates/horizon-client/src/profile_screen.rs
+@@ -288,7 +288,8 @@ impl Screen {
+     /// Typed characters, up to the longest name.
+     pub fn type_text(&mut self, text: &str) {
+         if let Some(name) = self.name_mut() {
+-            for c in text.chars().filter(|c| !c.is_control()) {
++            // A name in Minecraft: printable ASCII, no spaces.
++            for c in text.chars().filter(char::is_ascii_graphic) {
+                 if name.chars().count() < profile::MAX_NAME_CHARS {
+                     name.push(c);
+                 }
+@@ -441,8 +442,14 @@ impl Screen {
+                     let caret = left + 5.0 + HudBatch::text_width(atlas, name).ceil();
+                     batch.fill(atlas, caret, 55.0, 1.0, 10.0, white);
+                 }
++                centered(
++                    batch,
++                    "Your name in the game: up to 16 letters, numbers or symbols, no spaces",
++                    76.0,
++                    gray,
++                );
+                 if let Some(error) = error {
+-                    centered(batch, error, 80.0, red);
++                    centered(batch, error, 92.0, red);
+                 }
+             }
+             Self::ConfirmDelete { name, .. } => {
+@@ -692,4 +699,17 @@ mod tests {
+             other => panic!("expected the edit screen, got {other:?}"),
+         }
+     }
++
++    #[test]
++    fn typing_keeps_only_what_a_minecraft_name_can_have() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let mut screen = Screen::list(&profiles, "default");
++        screen.click(NEW, &mut profiles);
++        screen.type_text("An a\u{f1}_1-");
++        match &screen {
++            Screen::Edit { name, .. } => assert_eq!(name, "Ana_1-"),
++            other => panic!("expected the edit screen, got {other:?}"),
++        }
++    }
+ }
+-- 
+2.43.0
+
