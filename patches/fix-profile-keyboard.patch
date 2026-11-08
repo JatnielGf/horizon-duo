@@ -1,0 +1,310 @@
+From 470d096b79126e123350415bf6765816c9cd3bec Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 23:45:28 +0000
+Subject: [PATCH] Show the system keyboard for the profile name box
+
+The profile picker's name box was a plain drawn rectangle, so no tap on it was
+a text-field tap (widgets::Kind::Field, which is what makes the touch layer ask
+for the system keyboard) and the title's fields only get the keyboard from such
+a tap. Opening New or Rename by tapping a button never asked for it.
+
+The name box is now registered as a text field and has its own typing field,
+Field::Profile, which opens the keyboard with its screen like the chat does and
+closes it when the box goes (Save, Cancel or Back). Enter saves, as the Save
+button does, and a keyboard put away comes back with a tap on the box. Typed
+text, backspace and the hardware keyboard keep their existing paths.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../horizon-client/src/game/startup_menu.rs   | 12 +++-
+ crates/horizon-client/src/game/typing.rs      | 59 ++++++++++++++++++-
+ crates/horizon-client/src/profile_screen.rs   | 12 ++++
+ crates/horizon-client/src/title.rs            | 20 +++++++
+ crates/horizon-client/src/title/tests.rs      | 57 ++++++++++++++++++
+ 5 files changed, 155 insertions(+), 5 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/startup_menu.rs b/crates/horizon-client/src/game/startup_menu.rs
+index 8d540eb..8279892 100644
+--- a/crates/horizon-client/src/game/startup_menu.rs
++++ b/crates/horizon-client/src/game/startup_menu.rs
+@@ -479,8 +479,14 @@ impl Loading {
+         } else {
+             menu.title
+                 .as_ref()
+-                .is_some_and(Title::typing)
+-                .then_some(Field::Title)
++                .filter(|title| title.typing())
++                .map(|title| {
++                    if title.editing_profile() {
++                        Field::Profile
++                    } else {
++                        Field::Title
++                    }
++                })
+         }
+     }
+ 
+@@ -500,7 +506,7 @@ impl Loading {
+                 let events = self.menu.options.key(&mut self.settings, atlas, key, None);
+                 self.menu_option_events(events);
+             }
+-            Field::Title => {
++            Field::Title | Field::Profile => {
+                 match edit {
+                     Edit::Text(text) => self.menu.title_edit(Some(&text), false),
+                     Edit::Backspace => self.menu.title_edit(None, true),
+diff --git a/crates/horizon-client/src/game/typing.rs b/crates/horizon-client/src/game/typing.rs
+index f1e9e85..16be60f 100644
+--- a/crates/horizon-client/src/game/typing.rs
++++ b/crates/horizon-client/src/game/typing.rs
+@@ -28,6 +28,8 @@ pub(super) enum Field {
+     Options,
+     /// The title screens' fields: world names and seeds, the world search, server addresses.
+     Title,
++    /// The profile picker's name box: a screen made for typing, so the keyboard opens with it.
++    Profile,
+ }
+ 
+ impl Field {
+@@ -36,7 +38,7 @@ impl Field {
+     fn opens_keyboard(self) -> bool {
+         matches!(
+             self,
+-            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock
++            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock | Field::Profile
+         )
+     }
+     /// Enter ends the typing here; on a sign or a book's page it starts the next line.
+@@ -202,7 +204,13 @@ impl Game<'_> {
+             Screen::Win => None,
+             Screen::CommandBlock => Some(Field::CommandBlock),
+             Screen::Options => Some(Field::Options),
+-            _ => self.title.is_some().then_some(Field::Title),
++            _ => self.title.as_ref().map(|title| {
++                if title.editing_profile() {
++                    Field::Profile
++                } else {
++                    Field::Title
++                }
++            }),
+         }
+     }
+ 
+@@ -213,6 +221,7 @@ impl Game<'_> {
+             Field::WorldOptions => self.world_options_typing(),
+             Field::Options => self.ui.options.typing(),
+             Field::Title => self.title.as_ref().is_some_and(|t| t.typing()),
++            Field::Profile => true,
+             _ => true,
+         };
+         focused.then_some(field)
+@@ -276,6 +285,14 @@ impl Game<'_> {
+                 }
+                 _ => self.title_edit(text, backspace),
+             },
++            Field::Profile => match &edit {
++                Edit::Enter => {
++                    if let Some(title) = self.title.as_mut() {
++                        title.confirm_edit();
++                    }
++                }
++                _ => self.title_edit(text, backspace),
++            },
+         }
+     }
+ 
+@@ -296,6 +313,12 @@ impl Game<'_> {
+                 self.options_shortcut(all);
+             }
+             Field::Title => self.title_shortcut(all),
++            Field::Profile => {
++                if let Some(title) = self.title.as_mut() {
++                    title.profile_clear();
++                }
++                return;
++            }
+         }
+         self.edit_field(field, Edit::Backspace);
+     }
+@@ -386,6 +409,37 @@ mod tests {
+         assert_eq!(keyboard.step(Some(Field::Chat)), None);
+     }
+ 
++    #[test]
++    fn the_profile_name_box_opens_the_keyboard_with_its_screen_and_closes_it_after() {
++        let mut keyboard = SystemKeyboard::default();
++        // Tapping New opens the screen: the keyboard comes up without a tap on the box.
++        assert_eq!(keyboard.step(None), None);
++        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
++        assert_eq!(keyboard.step(Some(Field::Profile)), None);
++        // What it types reaches the box, and Enter saves (it ends the typing).
++        let typed = keyboard.input(Some(Field::Profile), SystemInput::Typed(Some("A")));
++        assert_eq!(typed, Some((Field::Profile, Edit::Text("A".into()))));
++        let enter = keyboard.input(Some(Field::Profile), SystemInput::Typed(Some("\n")));
++        assert_eq!(enter, Some((Field::Profile, Edit::Enter)));
++        // Saving or cancelling leaves the box: the keyboard goes.
++        assert_eq!(keyboard.step(None), Some(false));
++        // Back in the box, it comes up again.
++        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
++    }
++
++    #[test]
++    fn a_keyboard_put_away_comes_back_with_a_tap_on_the_name_box() {
++        let mut keyboard = SystemKeyboard::default();
++        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
++        // The iPad's hide key gives it up; only a tap asks again.
++        assert_eq!(
++            keyboard.input(Some(Field::Profile), SystemInput::Shown(false)),
++            None
++        );
++        assert_eq!(keyboard.step(Some(Field::Profile)), None);
++        assert_eq!(keyboard.request(Some(Field::Profile)), Some(true));
++    }
++
+     #[test]
+     fn a_field_focused_without_a_tap_waits_for_one() {
+         let mut keyboard = SystemKeyboard::default();
+@@ -447,6 +501,7 @@ mod tests {
+             (WorldOptions, false, false),
+             (Options, false, false),
+             (Title, false, false),
++            (Profile, true, false),
+         ];
+         for (field, opens, keeps) in policies {
+             assert_eq!(
+diff --git a/crates/horizon-client/src/profile_screen.rs b/crates/horizon-client/src/profile_screen.rs
+index 559b6a3..397c6ec 100644
+--- a/crates/horizon-client/src/profile_screen.rs
++++ b/crates/horizon-client/src/profile_screen.rs
+@@ -296,6 +296,13 @@ impl Screen {
+         }
+     }
+ 
++    /// Empties the name being typed.
++    pub fn clear_name(&mut self) {
++        if let Some(name) = self.name_mut() {
++            name.clear();
++        }
++    }
++
+     pub fn backspace(&mut self) {
+         if let Some(name) = self.name_mut() {
+             name.pop();
+@@ -415,6 +422,11 @@ impl Screen {
+                     36.0,
+                     white,
+                 );
++                // A text field for the touch layer: a tap on it asks for the keyboard.
++                crate::widgets::target_as(
++                    [left, 50.0, ROW_WIDTH, ROW_HEIGHT],
++                    crate::widgets::Kind::Field,
++                );
+                 batch.fill(atlas, left, 50.0, ROW_WIDTH, ROW_HEIGHT, white);
+                 batch.fill(
+                     atlas,
+diff --git a/crates/horizon-client/src/title.rs b/crates/horizon-client/src/title.rs
+index 27ab67d..3f8d6a0 100644
+--- a/crates/horizon-client/src/title.rs
++++ b/crates/horizon-client/src/title.rs
+@@ -1427,6 +1427,18 @@ impl Title {
+         }
+     }
+     /// A text field has the focus: typed text goes to it.
++    /// The profile picker's name box is open: the system keyboard comes up with it.
++    pub fn editing_profile(&self) -> bool {
++        matches!(&self.mode, Mode::Profiles(screen) if screen.typing())
++    }
++
++    /// Empties the profile's name box.
++    pub fn profile_clear(&mut self) {
++        if let Mode::Profiles(screen) = &mut self.mode {
++            screen.clear_name();
++        }
++    }
++
+     pub fn typing(&self) -> bool {
+         match &self.mode {
+             Mode::Select { .. } => self.search_focused,
+@@ -1543,6 +1555,14 @@ impl Title {
+         }
+     }
+     pub fn confirm_edit(&mut self) {
++        // Enter in the profile's name box saves it, as its Save button does.
++        if let Mode::Profiles(screen) = &mut self.mode {
++            if screen.typing() {
++                let mut profiles = crate::profile::Profiles::load(&self.profiles_root);
++                screen.click(crate::profile_screen::SAVE, &mut profiles);
++            }
++            return;
++        }
+         let Mode::Edit {
+             world,
+             name,
+diff --git a/crates/horizon-client/src/title/tests.rs b/crates/horizon-client/src/title/tests.rs
+index 023e95f..0535b99 100644
+--- a/crates/horizon-client/src/title/tests.rs
++++ b/crates/horizon-client/src/title/tests.rs
+@@ -923,3 +923,60 @@ fn choosing_a_profile_switches_only_where_the_menu_can() {
+         assert_eq!(crate::profile::Profiles::load(&home).active(), ana);
+     }
+ }
++
++#[test]
++fn the_profile_name_box_takes_typing_backspace_and_enter() {
++    let mut f = Fixture::new();
++    let home = f.root.join("home");
++    let profiles = crate::profile::Profiles::load(&home);
++    f.title.profiles_root = home.clone();
++    f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
++    assert!(!f.title.editing_profile(), "the list takes no typing");
++    let size = (480.0, 262.0);
++    let new = f
++        .title
++        .buttons(size.0, size.1)
++        .into_iter()
++        .find(|b| b.id == crate::profile_screen::NEW)
++        .unwrap();
++    f.title.click(new.x + 5.0, new.y + 5.0, size);
++    // New opens the name box: the game asks the system keyboard for it.
++    assert!(f.title.editing_profile());
++    assert!(f.title.typing());
++    f.title.type_text("Anaa");
++    f.title.backspace();
++    assert!(matches!(
++        &f.title.mode,
++        Mode::Profiles(crate::profile_screen::Screen::Edit { name, .. }) if name == "Ana"
++    ));
++    // Enter saves it and the box closes, so the keyboard goes.
++    f.title.confirm_edit();
++    assert!(!f.title.editing_profile());
++    let saved = crate::profile::Profiles::load(&home).list();
++    assert_eq!(saved.len(), 2);
++    assert_eq!(saved[1].name, "Ana");
++}
++
++#[test]
++fn cancelling_the_profile_name_box_closes_it_without_saving() {
++    let mut f = Fixture::new();
++    let home = f.root.join("home");
++    let profiles = crate::profile::Profiles::load(&home);
++    f.title.profiles_root = home.clone();
++    f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
++    let size = (480.0, 262.0);
++    let press = |f: &mut Fixture, id: u8| {
++        let b = f
++            .title
++            .buttons(size.0, size.1)
++            .into_iter()
++            .find(|b| b.id == id)
++            .unwrap();
++        f.title.click(b.x + 5.0, b.y + 5.0, size);
++    };
++    press(&mut f, crate::profile_screen::NEW);
++    f.title.type_text("Beto");
++    press(&mut f, crate::profile_screen::CANCEL);
++    assert!(!f.title.editing_profile());
++    assert_eq!(crate::profile::Profiles::load(&home).list().len(), 1);
++}
+-- 
+2.43.0
+
