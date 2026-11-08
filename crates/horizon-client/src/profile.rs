@@ -6,6 +6,12 @@
 //! entering a profile is just `set_current_dir(profile folder)` before the game
 //! starts (see `main.rs`). Nothing else needs to know about profiles.
 //!
+//! A profile's name is also the player's name in the game: a server sees it, and a world keeps the
+//! player's inventory under the UUID made from it (`offline_name` explains why every player needs
+//! a name of their own). So it follows Minecraft's rules for a name, and it is the only place the
+//! name of a profile is kept. The built-in profile has no name of its own: it keeps the offline
+//! name `offline_name` generates once into its game folder, as before.
+//!
 //! The built-in `default` profile *is* the game folder itself. A device with no
 //! `profiles.json`, or with `default` active, keeps every file where it was:
 //! there is nothing to migrate and nothing to move. The other profiles live in
@@ -24,8 +30,10 @@ pub const DIR: &str = "profiles";
 /// The built-in profile: the game folder itself.
 pub const DEFAULT_ID: &str = "default";
 pub const DEFAULT_NAME: &str = "Default";
-/// The longest name, in characters.
-pub const MAX_NAME_CHARS: usize = 32;
+/// The longest name, in characters: Minecraft's limit for a player's name.
+pub const MAX_NAME_CHARS: usize = 16;
+/// What an index written before names were players' names may hold.
+const MAX_STORED_NAME_CHARS: usize = 32;
 const ID_PREFIX: &str = "profile-";
 
 /// The profile this run of the game is in (the built-in one until `main` enters
@@ -87,12 +95,39 @@ fn is_extra_id(id: &str) -> bool {
     })
 }
 
-/// The name as kept: trimmed, with 1 to `MAX_NAME_CHARS` printable characters.
+/// The name as kept: trimmed, and a name a player can have in Minecraft (1 to 16 printable
+/// characters, no spaces: `offline_name::is_valid`).
 pub fn clean_name(name: &str) -> Option<String> {
     let name = name.trim();
+    crate::offline_name::is_valid(name).then(|| name.to_owned())
+}
+
+/// A name an index may hold: profiles made when any short label was allowed keep working.
+fn is_stored_name(name: &str) -> bool {
     let chars = name.chars().count();
-    ((1..=MAX_NAME_CHARS).contains(&chars) && !name.chars().any(char::is_control))
-        .then(|| name.to_owned())
+    name == name.trim()
+        && (1..=MAX_STORED_NAME_CHARS).contains(&chars)
+        && !name.chars().any(char::is_control)
+}
+
+/// The name `profile` plays under: its own when it is a Minecraft name, else the nearest one
+/// (spaces and other characters a name can't have become `_`, and the name is cut to 16
+/// characters). A name with nothing left of it is `Player` and the profile's number.
+pub fn player_name(profile: &Profile) -> String {
+    if crate::offline_name::is_valid(&profile.name) {
+        return profile.name.clone();
+    }
+    let name: String = profile
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '_' })
+        .take(MAX_NAME_CHARS)
+        .collect();
+    if name.chars().any(|c| c != '_') {
+        return name;
+    }
+    let number = profile.id.strip_prefix(ID_PREFIX).unwrap_or("0");
+    format!("Player{number}")
 }
 
 impl Profiles {
@@ -106,9 +141,7 @@ impl Profiles {
             .unwrap_or_default();
         let mut seen = Vec::new();
         index.profiles.retain(|p| {
-            let keep = is_extra_id(&p.id)
-                && clean_name(&p.name).is_some_and(|n| n == p.name)
-                && !seen.contains(&p.id);
+            let keep = is_extra_id(&p.id) && is_stored_name(&p.name) && !seen.contains(&p.id);
             if keep {
                 seen.push(p.id.clone());
             }
@@ -153,6 +186,22 @@ impl Profiles {
         }
     }
 
+    /// The name the profile with this id plays under, or `None` for the built-in one (it keeps
+    /// its offline name) and for an id that is not in the index.
+    pub fn player_name_of(&self, id: &str) -> Option<String> {
+        self.index
+            .profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(player_name)
+    }
+
+    /// The name this run of the game plays under when the player has not given one: the running
+    /// profile's, as the index has it now (a rename counts at once).
+    pub fn running_player_name(root: &Path) -> Option<String> {
+        Self::load(root).player_name_of(&running())
+    }
+
     /// The folder to enter before the game starts, or `None` when the game
     /// stays in its own folder (no extra profile is active).
     pub fn active_dir(&self) -> Option<PathBuf> {
@@ -163,8 +212,9 @@ impl Profiles {
     /// A new profile, with its folder, saved in the index. The name is only a
     /// label: it never becomes a path.
     pub fn create(&mut self, name: &str) -> io::Result<Profile> {
-        let name =
-            clean_name(name).ok_or_else(|| invalid("the name must be 1 to 32 characters"))?;
+        let name = clean_name(name).ok_or_else(|| {
+            invalid("the name must be 1 to 16 letters, numbers or symbols, without spaces")
+        })?;
         if self.name_taken(&name, None) {
             return Err(invalid("there is already a profile with that name"));
         }
@@ -186,8 +236,9 @@ impl Profiles {
 
     /// Gives a profile another name. The built-in one keeps its own.
     pub fn rename(&mut self, id: &str, name: &str) -> io::Result<()> {
-        let name =
-            clean_name(name).ok_or_else(|| invalid("the name must be 1 to 32 characters"))?;
+        let name = clean_name(name).ok_or_else(|| {
+            invalid("the name must be 1 to 16 letters, numbers or symbols, without spaces")
+        })?;
         if self.name_taken(&name, Some(id)) {
             return Err(invalid("there is already a profile with that name"));
         }
@@ -395,6 +446,63 @@ mod tests {
         let ids: Vec<_> = profiles.list().into_iter().map(|p| p.id).collect();
         assert_eq!(ids, ["default", "profile-3"]);
         assert!(profiles.active().is_default());
+    }
+
+    #[test]
+    fn a_profile_plays_under_its_own_name() {
+        let root = temp_root();
+        let mut profiles = Profiles::load(&root);
+        let ana = profiles.create("Ana").unwrap();
+        assert_eq!(profiles.player_name_of(&ana.id).as_deref(), Some("Ana"));
+        // The built-in profile keeps its generated offline name, and an unknown id has none.
+        assert_eq!(profiles.player_name_of(DEFAULT_ID), None);
+        assert_eq!(profiles.player_name_of("profile-9"), None);
+        // A rename counts at once, and after a restart.
+        profiles.rename(&ana.id, "Anita").unwrap();
+        assert_eq!(profiles.player_name_of(&ana.id).as_deref(), Some("Anita"));
+        let again = Profiles::load(&root);
+        assert_eq!(again.player_name_of(&ana.id).as_deref(), Some("Anita"));
+        // Another profile is another player.
+        let beto = profiles.create("Beto").unwrap();
+        assert_ne!(
+            profiles.player_name_of(&beto.id),
+            profiles.player_name_of(&ana.id)
+        );
+    }
+
+    #[test]
+    fn a_name_is_a_name_a_player_can_have() {
+        let root = temp_root();
+        let mut profiles = Profiles::load(&root);
+        assert!(profiles.create("Ana Maria").is_err(), "no spaces");
+        assert!(profiles.create("\u{f1}and\u{fa}").is_err(), "no accents");
+        assert!(profiles.create("Ana_01").is_ok());
+        assert!(profiles.create(&"x".repeat(17)).is_err(), "16 at most");
+    }
+
+    #[test]
+    fn an_old_label_that_is_not_a_player_name_plays_under_the_nearest_one() {
+        let root = temp_root();
+        let index = r#"{"profiles": [
+            {"id": "profile-1", "name": "Ana Maria"},
+            {"id": "profile-2", "name": "\u65e5\u672c\u8a9e"},
+            {"id": "profile-3", "name": "A very long profile name"},
+            {"id": "profile-4", "name": "Beto"}
+        ]}"#;
+        fs::write(root.join(INDEX_FILE), index).unwrap();
+        let profiles = Profiles::load(&root);
+        // None is dropped, and each keeps a valid name, the same every time.
+        assert_eq!(profiles.list().len(), 5);
+        for (id, expected) in [
+            ("profile-1", "Ana_Maria"),
+            ("profile-2", "Player2"),
+            ("profile-3", "A_very_long_prof"),
+            ("profile-4", "Beto"),
+        ] {
+            let name = profiles.player_name_of(id).unwrap();
+            assert_eq!(name, expected, "{id}");
+            assert!(crate::offline_name::is_valid(&name), "{name}");
+        }
     }
 
     #[test]

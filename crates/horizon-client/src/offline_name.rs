@@ -7,7 +7,12 @@
 //! refused with "You logged in from another location". The generated name is
 //! kept in `horizon-player.txt` next to `options.txt` so the same player gets
 //! the same offline UUID (and inventory on a friend's world) every time.
-use std::{fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
+};
 
 pub const FILE: &str = "horizon-player.txt";
 const KEY: &str = "name:";
@@ -23,14 +28,25 @@ pub fn generate(seed: u64) -> String {
     format!("Player{:05}", seed % 100_000)
 }
 
+/// The names this run made, by folder: one that couldn't be written is still the same name the
+/// next time it is asked for, not a new one each time.
+static MADE: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+
 /// The name kept in `dir`, created on first use. A file that can't be written
-/// still yields a name for this run.
+/// still yields a name for this run, the same one every time.
 pub fn load_or_create(dir: &Path) -> String {
     let path = dir.join(FILE);
     if let Some(name) = fs::read_to_string(&path).ok().and_then(|text| parse(&text)) {
         return name;
     }
+    let mut made = MADE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(name) = made.get(dir) {
+        // Another try at keeping it, in case the folder is writable now.
+        let _ = fs::write(&path, format!("{KEY}{name}\n"));
+        return name.clone();
+    }
     let name = generate(seed());
+    made.insert(dir.to_owned(), name.clone());
     if let Err(e) = fs::write(&path, format!("{KEY}{name}\n")) {
         log::warn!(
             "Horizon: could not keep the player name in {}: {e}",
@@ -118,5 +134,30 @@ mod tests {
             assert_eq!(load_or_create(&d), name);
             let _ = fs::remove_dir_all(&d);
         }
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_kept_is_still_the_same_name_each_time() {
+        // No such folder: nothing can be written there.
+        let nowhere = std::env::temp_dir().join(format!(
+            "horizon-offline-name-nowhere-{}/missing",
+            std::process::id()
+        ));
+        let first = load_or_create(&nowhere);
+        assert!(is_valid(&first));
+        for _ in 0..5 {
+            assert_eq!(load_or_create(&nowhere), first);
+        }
+    }
+
+    #[test]
+    fn a_name_kept_in_a_folder_is_read_back_by_the_next_run() {
+        let d = dir("kept");
+        let first = load_or_create(&d);
+        assert_eq!(
+            fs::read_to_string(d.join(FILE)).unwrap(),
+            format!("name:{first}\n")
+        );
+        assert_eq!(load_or_create(&d), first);
     }
 }

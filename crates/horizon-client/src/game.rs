@@ -304,7 +304,7 @@ struct Options {
     /// Multiplayer: `--server HOST[:PORT]` joins at start; `--name` is the offline player name.
     server: Option<String>,
     /// `--name`, `HORIZON_PLAYER_NAME` or the signed-in account's name; else
-    /// [`Options::player_name`] uses the kept offline name.
+    /// [`Options::player_name`] uses the running profile's name, or the kept offline name.
     player_name: Option<String>,
     /// `--dedicated`: run as a dedicated server; vanilla's server arguments
     /// (`--nogui`, `--port`, `--world`, `--universe`, `--initSettings`) follow.
@@ -321,15 +321,23 @@ struct Options {
     integrated: bool,
 }
 impl Options {
-    /// The name to join servers with: the one given, else the offline name kept
-    /// next to options.txt (created on first use).
+    /// The name to join servers with: the one given, else the running profile's name (a profile
+    /// is a player), else the offline name kept next to options.txt (created on first use), which
+    /// the built-in profile keeps playing under.
     fn player_name(&self) -> String {
-        self.player_name.clone().unwrap_or_else(|| {
-            std::env::current_dir().map_or_else(
-                |_| horizon_client::offline_name::generate(0),
-                |dir| horizon_client::offline_name::load_or_create(&dir),
-            )
-        })
+        self.player_name
+            .clone()
+            .or_else(|| {
+                horizon_client::profile::Profiles::running_player_name(
+                    &horizon_client::logging::game_home(),
+                )
+            })
+            .unwrap_or_else(|| {
+                std::env::current_dir().map_or_else(
+                    |_| horizon_client::offline_name::generate(0),
+                    |dir| horizon_client::offline_name::load_or_create(&dir),
+                )
+            })
     }
     fn read() -> Result<Option<Self>> {
         // codesign takes an iOS app's `resources` for a macOS bundle's Resources and refuses it.

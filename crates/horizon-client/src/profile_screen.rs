@@ -288,7 +288,8 @@ impl Screen {
     /// Typed characters, up to the longest name.
     pub fn type_text(&mut self, text: &str) {
         if let Some(name) = self.name_mut() {
-            for c in text.chars().filter(|c| !c.is_control()) {
+            // A name in Minecraft: printable ASCII, no spaces.
+            for c in text.chars().filter(char::is_ascii_graphic) {
                 if name.chars().count() < profile::MAX_NAME_CHARS {
                     name.push(c);
                 }
@@ -441,8 +442,14 @@ impl Screen {
                     let caret = left + 5.0 + HudBatch::text_width(atlas, name).ceil();
                     batch.fill(atlas, caret, 55.0, 1.0, 10.0, white);
                 }
+                centered(
+                    batch,
+                    "Your name in the game: up to 16 letters, numbers or symbols, no spaces",
+                    76.0,
+                    gray,
+                );
                 if let Some(error) = error {
-                    centered(batch, error, 80.0, red);
+                    centered(batch, error, 92.0, red);
                 }
             }
             Self::ConfirmDelete { name, .. } => {
@@ -689,6 +696,19 @@ mod tests {
             Screen::Edit { name, .. } => {
                 assert_eq!(name.chars().count(), profile::MAX_NAME_CHARS);
             }
+            other => panic!("expected the edit screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typing_keeps_only_what_a_minecraft_name_can_have() {
+        let root = temp_root();
+        let mut profiles = Profiles::load(&root);
+        let mut screen = Screen::list(&profiles, "default");
+        screen.click(NEW, &mut profiles);
+        screen.type_text("An a\u{f1}_1-");
+        match &screen {
+            Screen::Edit { name, .. } => assert_eq!(name, "Ana_1-"),
             other => panic!("expected the edit screen, got {other:?}"),
         }
     }
