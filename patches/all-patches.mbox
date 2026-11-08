@@ -1,0 +1,2213 @@
+From 8a98327ec6bca24283a17228adbaad2c167f9595 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 11:25:51 +0000
+Subject: [PATCH 1/6] Add local player profiles (model only, iOS startup)
+
+profile.rs keeps an index (profiles.json) of extra profiles, each with its
+own game folder under profiles/profile-N. The built-in `default` profile is
+the game folder itself, so a device without profiles.json starts exactly as
+before and nothing is moved. On iOS, main.rs enters the active profile's
+folder after the existing set_current_dir(home); logs stay in the game folder.
+
+No UI yet: the profile picker is the next PR.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/lib.rs     |   1 +
+ crates/horizon-client/src/main.rs    |   8 +
+ crates/horizon-client/src/profile.rs | 397 +++++++++++++++++++++++++++
+ 3 files changed, 406 insertions(+)
+ create mode 100644 crates/horizon-client/src/profile.rs
+
+diff --git a/crates/horizon-client/src/lib.rs b/crates/horizon-client/src/lib.rs
+index 37a9dc0..81ae845 100644
+--- a/crates/horizon-client/src/lib.rs
++++ b/crates/horizon-client/src/lib.rs
+@@ -143,6 +143,7 @@ pub mod player_sync;
+ pub mod poi_sections;
+ pub mod portal_sections;
+ pub mod pose;
++pub mod profile;
+ pub mod projectiles;
+ pub mod raid;
+ pub mod random_sequences;
+diff --git a/crates/horizon-client/src/main.rs b/crates/horizon-client/src/main.rs
+index d091588..d85ef90 100644
+--- a/crates/horizon-client/src/main.rs
++++ b/crates/horizon-client/src/main.rs
+@@ -20,6 +20,14 @@ fn main() {
+     if let Err(e) = std::fs::create_dir_all(&home).and_then(|()| std::env::set_current_dir(&home)) {
+         eprintln!("Horizon: {}: {e}", home.display());
+     }
++    // A profile other than the built-in one keeps its own options, saves and
++    // packs in a folder of its own; logs stay in `home`.
++    #[cfg(target_os = "ios")]
++    if let Some(dir) = horizon_client::profile::Profiles::load(&home).active_dir()
++        && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir))
++    {
++        eprintln!("Horizon: {}: {e}", dir.display());
++    }
+     if !help {
+         logging::init(&home, thread);
+         crash::install(home.clone(), side);
+diff --git a/crates/horizon-client/src/profile.rs b/crates/horizon-client/src/profile.rs
+new file mode 100644
+index 0000000..f3b4327
+--- /dev/null
++++ b/crates/horizon-client/src/profile.rs
+@@ -0,0 +1,397 @@
++//! Local player profiles: each one has its own game folder (options, saves,
++//! servers, resource packs, mods and the offline player name), so two people
++//! sharing one device keep separate settings.
++//!
++//! The game reads and writes everything relative to its working directory, so
++//! entering a profile is just `set_current_dir(profile folder)` before the game
++//! starts (see `main.rs`). Nothing else needs to know about profiles.
++//!
++//! The built-in `default` profile *is* the game folder itself. A device with no
++//! `profiles.json`, or with `default` active, keeps every file where it was:
++//! there is nothing to migrate and nothing to move. The other profiles live in
++//! `profiles/profile-N/` next to the index. Logs and crash reports stay in the
++//! game folder, whichever profile is active.
++use serde::{Deserialize, Serialize};
++use std::{
++    fs, io,
++    path::{Path, PathBuf},
++};
++
++/// The index of the extra profiles, in the game folder.
++pub const INDEX_FILE: &str = "profiles.json";
++/// The folder of the extra profiles, in the game folder.
++pub const DIR: &str = "profiles";
++/// The built-in profile: the game folder itself.
++pub const DEFAULT_ID: &str = "default";
++pub const DEFAULT_NAME: &str = "Default";
++/// The longest name, in characters.
++pub const MAX_NAME_CHARS: usize = 32;
++const ID_PREFIX: &str = "profile-";
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Profile {
++    pub id: String,
++    pub name: String,
++}
++
++impl Profile {
++    fn builtin() -> Self {
++        Self {
++            id: DEFAULT_ID.into(),
++            name: DEFAULT_NAME.into(),
++        }
++    }
++
++    pub fn is_default(&self) -> bool {
++        self.id == DEFAULT_ID
++    }
++}
++
++/// What `profiles.json` holds: the extra profiles and the active one. The
++/// built-in profile is never stored.
++#[derive(Default, Serialize, Deserialize)]
++struct Index {
++    #[serde(default)]
++    active: Option<String>,
++    #[serde(default)]
++    profiles: Vec<Profile>,
++}
++
++/// The profiles of one game folder.
++pub struct Profiles {
++    root: PathBuf,
++    index: Index,
++}
++
++/// `profile-N` with N a positive number: the only ids that name a folder, so
++/// an index edited by hand can't point outside `profiles/`.
++fn is_extra_id(id: &str) -> bool {
++    id.strip_prefix(ID_PREFIX).is_some_and(|n| {
++        !n.is_empty()
++            && n.len() <= 9
++            && !n.starts_with('0')
++            && n.bytes().all(|b| b.is_ascii_digit())
++    })
++}
++
++/// The name as kept: trimmed, with 1 to `MAX_NAME_CHARS` printable characters.
++pub fn clean_name(name: &str) -> Option<String> {
++    let name = name.trim();
++    let chars = name.chars().count();
++    ((1..=MAX_NAME_CHARS).contains(&chars) && !name.chars().any(char::is_control))
++        .then(|| name.to_owned())
++}
++
++impl Profiles {
++    /// The profiles of `root`. A missing or unreadable index means no extra
++    /// profiles (and so no change to how the game starts); entries that are not
++    /// valid are dropped, and an active profile that no longer exists is unset.
++    pub fn load(root: &Path) -> Self {
++        let mut index: Index = fs::read_to_string(root.join(INDEX_FILE))
++            .ok()
++            .and_then(|text| serde_json::from_str(&text).ok())
++            .unwrap_or_default();
++        let mut seen = Vec::new();
++        index.profiles.retain(|p| {
++            let keep = is_extra_id(&p.id)
++                && clean_name(&p.name).is_some_and(|n| n == p.name)
++                && !seen.contains(&p.id);
++            if keep {
++                seen.push(p.id.clone());
++            }
++            keep
++        });
++        if index
++            .active
++            .as_deref()
++            .is_some_and(|a| a != DEFAULT_ID && !seen.iter().any(|id| id == a))
++        {
++            index.active = None;
++        }
++        Self {
++            root: root.to_owned(),
++            index,
++        }
++    }
++
++    /// Every profile, the built-in one first.
++    pub fn list(&self) -> Vec<Profile> {
++        std::iter::once(Profile::builtin())
++            .chain(self.index.profiles.iter().cloned())
++            .collect()
++    }
++
++    /// The profile the game starts in.
++    pub fn active(&self) -> Profile {
++        self.index
++            .active
++            .as_deref()
++            .and_then(|id| self.index.profiles.iter().find(|p| p.id == id))
++            .cloned()
++            .unwrap_or_else(Profile::builtin)
++    }
++
++    /// The game folder of `profile`.
++    pub fn dir(&self, profile: &Profile) -> PathBuf {
++        if profile.is_default() {
++            self.root.clone()
++        } else {
++            self.root.join(DIR).join(&profile.id)
++        }
++    }
++
++    /// The folder to enter before the game starts, or `None` when the game
++    /// stays in its own folder (no extra profile is active).
++    pub fn active_dir(&self) -> Option<PathBuf> {
++        let active = self.active();
++        (!active.is_default()).then(|| self.dir(&active))
++    }
++
++    /// A new profile, with its folder, saved in the index. The name is only a
++    /// label: it never becomes a path.
++    pub fn create(&mut self, name: &str) -> io::Result<Profile> {
++        let name =
++            clean_name(name).ok_or_else(|| invalid("the name must be 1 to 32 characters"))?;
++        if self.name_taken(&name, None) {
++            return Err(invalid("there is already a profile with that name"));
++        }
++        let number = (1u32..)
++            .find(|n| {
++                let id = format!("{ID_PREFIX}{n}");
++                !self.index.profiles.iter().any(|p| p.id == id)
++            })
++            .unwrap_or(1);
++        let profile = Profile {
++            id: format!("{ID_PREFIX}{number}"),
++            name,
++        };
++        fs::create_dir_all(self.dir(&profile))?;
++        self.index.profiles.push(profile.clone());
++        self.save()?;
++        Ok(profile)
++    }
++
++    /// Gives a profile another name. The built-in one keeps its own.
++    pub fn rename(&mut self, id: &str, name: &str) -> io::Result<()> {
++        let name =
++            clean_name(name).ok_or_else(|| invalid("the name must be 1 to 32 characters"))?;
++        if self.name_taken(&name, Some(id)) {
++            return Err(invalid("there is already a profile with that name"));
++        }
++        let profile = self
++            .index
++            .profiles
++            .iter_mut()
++            .find(|p| p.id == id)
++            .ok_or_else(|| invalid("no such profile"))?;
++        profile.name = name;
++        self.save()
++    }
++
++    /// Makes `id` the profile the game starts in next time.
++    pub fn set_active(&mut self, id: &str) -> io::Result<()> {
++        if id != DEFAULT_ID && !self.index.profiles.iter().any(|p| p.id == id) {
++            return Err(invalid("no such profile"));
++        }
++        self.index.active = (id != DEFAULT_ID).then(|| id.to_owned());
++        self.save()
++    }
++
++    /// Removes a profile from the index and deletes its folder, with its saves.
++    /// The built-in profile can't be deleted. When the deleted profile was the
++    /// active one, the built-in profile becomes active.
++    pub fn delete(&mut self, id: &str) -> io::Result<()> {
++        let at = self
++            .index
++            .profiles
++            .iter()
++            .position(|p| p.id == id)
++            .ok_or_else(|| invalid("no such profile"))?;
++        let profile = self.index.profiles.remove(at);
++        if self.index.active.as_deref() == Some(id) {
++            self.index.active = None;
++        }
++        // The index goes first: a folder left behind is only wasted space, while
++        // an entry whose folder is gone would just be created empty again.
++        self.save()?;
++        match fs::remove_dir_all(self.dir(&profile)) {
++            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
++            _ => Ok(()),
++        }
++    }
++
++    fn name_taken(&self, name: &str, except: Option<&str>) -> bool {
++        name.eq_ignore_ascii_case(DEFAULT_NAME)
++            || self
++                .index
++                .profiles
++                .iter()
++                .any(|p| Some(p.id.as_str()) != except && p.name.eq_ignore_ascii_case(name))
++    }
++
++    /// Writes the index through a temporary file, so a crash leaves the old one.
++    fn save(&self) -> io::Result<()> {
++        let text = serde_json::to_string_pretty(&self.index).map_err(io::Error::other)?;
++        fs::create_dir_all(&self.root)?;
++        let path = self.root.join(INDEX_FILE);
++        let tmp = self.root.join(format!("{INDEX_FILE}.tmp"));
++        fs::write(&tmp, text)?;
++        fs::rename(&tmp, &path)
++    }
++}
++
++fn invalid(message: &str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidInput, message)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicU32, Ordering};
++
++    /// A fresh empty folder under the system's temporary one.
++    fn temp_root() -> PathBuf {
++        static NEXT: AtomicU32 = AtomicU32::new(0);
++        let dir = std::env::temp_dir().join(format!(
++            "horizon-profile-test-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    #[test]
++    fn no_index_changes_nothing() {
++        let root = temp_root();
++        let profiles = Profiles::load(&root);
++        assert_eq!(profiles.list(), vec![Profile::builtin()]);
++        assert!(profiles.active().is_default());
++        assert_eq!(profiles.active_dir(), None);
++        // Loading never writes anything.
++        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
++    }
++
++    #[test]
++    fn broken_index_is_ignored() {
++        let root = temp_root();
++        fs::write(root.join(INDEX_FILE), "{ not json").unwrap();
++        let profiles = Profiles::load(&root);
++        assert_eq!(profiles.list().len(), 1);
++        assert_eq!(profiles.active_dir(), None);
++    }
++
++    #[test]
++    fn create_makes_the_folder_and_the_index() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let a = profiles.create("  Ana ").unwrap();
++        let b = profiles.create("Beto").unwrap();
++        assert_eq!((a.id.as_str(), a.name.as_str()), ("profile-1", "Ana"));
++        assert_eq!(b.id, "profile-2");
++        assert!(root.join("profiles/profile-1").is_dir());
++        // A second start sees the same profiles.
++        let again = Profiles::load(&root);
++        assert_eq!(again.list().len(), 3);
++        assert_eq!(again.list()[1], a);
++    }
++
++    #[test]
++    fn names_are_checked() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        assert!(profiles.create("   ").is_err());
++        assert!(profiles.create("a\nb").is_err());
++        assert!(profiles.create(&"x".repeat(MAX_NAME_CHARS + 1)).is_err());
++        assert!(profiles.create(&"x".repeat(MAX_NAME_CHARS)).is_ok());
++        assert!(profiles.create("default").is_err());
++        profiles.create("Ana").unwrap();
++        assert!(profiles.create("ANA").is_err());
++        // A name is a label, never a path.
++        let p = profiles.create("../../etc").unwrap();
++        assert!(profiles.dir(&p).starts_with(root.join(DIR)));
++        assert!(profiles.dir(&p).ends_with(&p.id));
++    }
++
++    #[test]
++    fn the_active_profile_decides_the_folder() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let ana = profiles.create("Ana").unwrap();
++        assert_eq!(profiles.active_dir(), None);
++        profiles.set_active(&ana.id).unwrap();
++        let again = Profiles::load(&root);
++        assert_eq!(again.active(), ana);
++        assert_eq!(
++            again.active_dir(),
++            Some(root.join("profiles").join(&ana.id))
++        );
++        // Back to the built-in profile: the game folder itself, no change.
++        let mut again = again;
++        again.set_active(DEFAULT_ID).unwrap();
++        assert_eq!(Profiles::load(&root).active_dir(), None);
++        assert!(again.set_active("profile-99").is_err());
++    }
++
++    #[test]
++    fn delete_removes_folder_and_resets_active() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let ana = profiles.create("Ana").unwrap();
++        profiles.set_active(&ana.id).unwrap();
++        fs::write(profiles.dir(&ana).join("options.txt"), "x").unwrap();
++        profiles.delete(&ana.id).unwrap();
++        assert!(!root.join("profiles/profile-1").exists());
++        assert!(profiles.active().is_default());
++        assert!(profiles.delete(DEFAULT_ID).is_err());
++        assert!(profiles.delete(&ana.id).is_err());
++        // The id is free again.
++        assert_eq!(profiles.create("Otra").unwrap().id, "profile-1");
++    }
++
++    #[test]
++    fn rename_keeps_the_folder() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let ana = profiles.create("Ana").unwrap();
++        profiles.create("Beto").unwrap();
++        profiles.rename(&ana.id, "Anita").unwrap();
++        assert!(profiles.rename(&ana.id, "beto").is_err());
++        assert!(profiles.rename(DEFAULT_ID, "Otro").is_err());
++        let again = Profiles::load(&root);
++        assert_eq!(again.list()[1].name, "Anita");
++        assert_eq!(again.list()[1].id, ana.id);
++    }
++
++    #[test]
++    fn a_hand_edited_index_cannot_leave_the_profiles_folder() {
++        let root = temp_root();
++        let index = r#"{
++            "active": "../../x",
++            "profiles": [
++                {"id": "../../x", "name": "Evil"},
++                {"id": "profile-01", "name": "Zero"},
++                {"id": "profile-3", "name": "Ok"},
++                {"id": "profile-3", "name": "Twice"},
++                {"id": "profile-4", "name": ""}
++            ]
++        }"#;
++        fs::write(root.join(INDEX_FILE), index).unwrap();
++        let profiles = Profiles::load(&root);
++        let ids: Vec<_> = profiles.list().into_iter().map(|p| p.id).collect();
++        assert_eq!(ids, ["default", "profile-3"]);
++        assert!(profiles.active().is_default());
++    }
++
++    #[test]
++    fn a_missing_active_profile_is_unset() {
++        let root = temp_root();
++        fs::write(
++            root.join(INDEX_FILE),
++            r#"{"active": "profile-7", "profiles": []}"#,
++        )
++        .unwrap();
++        assert_eq!(Profiles::load(&root).active_dir(), None);
++    }
++}
+-- 
+2.43.0
+
+
+From 7f35e2cfb21726b6f6fcbfb51c35d4dfcd6bfa10 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 11:44:00 +0000
+Subject: [PATCH 2/6] Add the profile picker's state machine (logic only)
+
+profile_screen.rs holds what the picker shows and does: the profile list
+with the current one selected, new and rename with a typed name, delete with
+a confirmation, and what each button asks for (Back or Switch). It draws
+nothing and is not shown yet; the title screen wiring is the next commit of
+this PR.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/lib.rs            |   1 +
+ crates/horizon-client/src/profile_screen.rs | 449 ++++++++++++++++++++
+ 2 files changed, 450 insertions(+)
+ create mode 100644 crates/horizon-client/src/profile_screen.rs
+
+diff --git a/crates/horizon-client/src/lib.rs b/crates/horizon-client/src/lib.rs
+index 81ae845..854a48f 100644
+--- a/crates/horizon-client/src/lib.rs
++++ b/crates/horizon-client/src/lib.rs
+@@ -144,6 +144,7 @@ pub mod poi_sections;
+ pub mod portal_sections;
+ pub mod pose;
+ pub mod profile;
++pub mod profile_screen;
+ pub mod projectiles;
+ pub mod raid;
+ pub mod random_sequences;
+diff --git a/crates/horizon-client/src/profile_screen.rs b/crates/horizon-client/src/profile_screen.rs
+new file mode 100644
+index 0000000..05cd7ce
+--- /dev/null
++++ b/crates/horizon-client/src/profile_screen.rs
+@@ -0,0 +1,449 @@
++//! The state of the profile picker: which profile is selected, the name being
++//! typed, the delete confirmation, and what each button asks for. It draws
++//! nothing and starts nothing; the title screen shows it and acts on its
++//! [`Outcome`], as it does for `multiplayer::Screen`.
++use crate::profile::{self, Profile, Profiles};
++
++/// A button: x, y, width, label, enabled, id (the shape `multiplayer` uses).
++pub type ButtonSpec = (f32, f32, f32, String, bool, u8);
++
++pub const USE: u8 = 0;
++pub const NEW: u8 = 1;
++pub const RENAME: u8 = 2;
++pub const DELETE: u8 = 3;
++pub const BACK: u8 = 4;
++pub const SAVE: u8 = 5;
++pub const CANCEL: u8 = 6;
++pub const CONFIRM: u8 = 7;
++
++/// What a click asks the title screen to do.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Outcome {
++    None,
++    /// Leave the picker.
++    Back,
++    /// Start playing in the profile with this id (it is already active in the
++    /// index; the caller moves the game into its folder).
++    Switch(String),
++}
++
++#[derive(Debug)]
++pub enum Screen {
++    List {
++        profiles: Vec<Profile>,
++        selected: usize,
++        /// The id of the profile the game is in.
++        current: String,
++        /// Why the last button did nothing (a folder that could not be made).
++        error: Option<String>,
++    },
++    /// A new profile (`id` None) or a new name for one.
++    Edit {
++        id: Option<String>,
++        name: String,
++        error: Option<String>,
++    },
++    ConfirmDelete {
++        id: String,
++        name: String,
++    },
++}
++
++impl Screen {
++    /// The picker, with the profile the game is in selected.
++    pub fn list(profiles: &Profiles, current: &str) -> Self {
++        let all = profiles.list();
++        let selected = all.iter().position(|p| p.id == current).unwrap_or(0);
++        Self::List {
++            profiles: all,
++            selected,
++            current: current.to_owned(),
++            error: None,
++        }
++    }
++
++    /// Buttons for a window of `w` by `h`, in the picker's column.
++    pub fn buttons(&self, w: f32, h: f32) -> Vec<ButtonSpec> {
++        let x = w / 2.0 - 100.0;
++        let bottom = h - 52.0;
++        let text = |key: &str| key.to_owned();
++        match self {
++            Self::List {
++                profiles,
++                selected,
++                current,
++                ..
++            } => {
++                let chosen = profiles.get(*selected);
++                let custom = chosen.is_some_and(|p| !p.is_default());
++                let in_use = chosen.is_some_and(|p| p.id == *current);
++                vec![
++                    (
++                        x,
++                        bottom - 72.0,
++                        98.0,
++                        text("Use"),
++                        chosen.is_some() && !in_use,
++                        USE,
++                    ),
++                    (x + 102.0, bottom - 72.0, 98.0, text("New"), true, NEW),
++                    (x, bottom - 48.0, 98.0, text("Rename"), custom, RENAME),
++                    (
++                        x + 102.0,
++                        bottom - 48.0,
++                        98.0,
++                        text("Delete"),
++                        custom && !in_use,
++                        DELETE,
++                    ),
++                    (x, bottom - 24.0, 200.0, text("Back"), true, BACK),
++                ]
++            }
++            Self::Edit { name, .. } => vec![
++                (
++                    x,
++                    bottom - 24.0,
++                    98.0,
++                    text("Save"),
++                    profile::clean_name(name).is_some(),
++                    SAVE,
++                ),
++                (x + 102.0, bottom - 24.0, 98.0, text("Cancel"), true, CANCEL),
++            ],
++            Self::ConfirmDelete { .. } => vec![
++                (x, bottom - 24.0, 98.0, text("Delete"), true, CONFIRM),
++                (x + 102.0, bottom - 24.0, 98.0, text("Cancel"), true, CANCEL),
++            ],
++        }
++    }
++
++    /// Selects the row at index `row` of the list, if there is one.
++    pub fn select(&mut self, row: usize) {
++        if let Self::List {
++            profiles, selected, ..
++        } = self
++            && row < profiles.len()
++        {
++            *selected = row;
++        }
++    }
++
++    /// A button was pressed.
++    pub fn click(&mut self, id: u8, profiles: &mut Profiles) -> Outcome {
++        match (&mut *self, id) {
++            (Self::List { .. }, BACK) => Outcome::Back,
++            (
++                Self::List {
++                    profiles: all,
++                    selected,
++                    current,
++                    error,
++                },
++                USE,
++            ) => {
++                let Some(target) = all.get(*selected).cloned() else {
++                    return Outcome::None;
++                };
++                if target.id == *current {
++                    return Outcome::None;
++                }
++                match profiles.set_active(&target.id) {
++                    Ok(()) => {
++                        *current = target.id.clone();
++                        Outcome::Switch(target.id)
++                    }
++                    Err(e) => {
++                        *error = Some(e.to_string());
++                        Outcome::None
++                    }
++                }
++            }
++            (Self::List { .. }, NEW) => {
++                *self = Self::Edit {
++                    id: None,
++                    name: String::new(),
++                    error: None,
++                };
++                Outcome::None
++            }
++            (
++                Self::List {
++                    profiles: all,
++                    selected,
++                    ..
++                },
++                RENAME,
++            ) => {
++                if let Some(p) = all.get(*selected).filter(|p| !p.is_default()) {
++                    *self = Self::Edit {
++                        id: Some(p.id.clone()),
++                        name: p.name.clone(),
++                        error: None,
++                    };
++                }
++                Outcome::None
++            }
++            (
++                Self::List {
++                    profiles: all,
++                    selected,
++                    current,
++                    ..
++                },
++                DELETE,
++            ) => {
++                if let Some(p) = all
++                    .get(*selected)
++                    .filter(|p| !p.is_default() && p.id != *current)
++                {
++                    *self = Self::ConfirmDelete {
++                        id: p.id.clone(),
++                        name: p.name.clone(),
++                    };
++                }
++                Outcome::None
++            }
++            (Self::Edit { id, name, error }, SAVE) => {
++                let saved = match id {
++                    Some(id) => profiles.rename(id, name),
++                    None => profiles.create(name).map(|_| ()),
++                };
++                match saved {
++                    Ok(()) => self.back_to_list(profiles),
++                    Err(e) => *error = Some(e.to_string()),
++                }
++                Outcome::None
++            }
++            (Self::ConfirmDelete { id, .. }, CONFIRM) => {
++                let result = profiles.delete(id);
++                self.back_to_list(profiles);
++                if let (Err(e), Self::List { error, .. }) = (result, &mut *self) {
++                    *error = Some(e.to_string());
++                }
++                Outcome::None
++            }
++            (Self::Edit { .. } | Self::ConfirmDelete { .. }, CANCEL) => {
++                self.back_to_list(profiles);
++                Outcome::None
++            }
++            _ => Outcome::None,
++        }
++    }
++
++    /// Escape: one step back, and `true` when the picker itself should close.
++    pub fn escape(&mut self, profiles: &Profiles) -> bool {
++        match self {
++            Self::List { .. } => true,
++            Self::Edit { .. } | Self::ConfirmDelete { .. } => {
++                self.back_to_list(profiles);
++                false
++            }
++        }
++    }
++
++    /// The name being typed, when a name is.
++    pub fn name_mut(&mut self) -> Option<&mut String> {
++        match self {
++            Self::Edit { name, error, .. } => {
++                *error = None;
++                Some(name)
++            }
++            _ => None,
++        }
++    }
++
++    pub fn typing(&self) -> bool {
++        matches!(self, Self::Edit { .. })
++    }
++
++    /// Typed characters, up to the longest name.
++    pub fn type_text(&mut self, text: &str) {
++        if let Some(name) = self.name_mut() {
++            for c in text.chars().filter(|c| !c.is_control()) {
++                if name.chars().count() < profile::MAX_NAME_CHARS {
++                    name.push(c);
++                }
++            }
++        }
++    }
++
++    pub fn backspace(&mut self) {
++        if let Some(name) = self.name_mut() {
++            name.pop();
++        }
++    }
++
++    /// Back to the list, with the current profile selected again.
++    fn back_to_list(&mut self, profiles: &Profiles) {
++        let current = profiles.active().id;
++        *self = Self::list(profiles, &current);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{
++        fs,
++        path::PathBuf,
++        sync::atomic::{AtomicU32, Ordering},
++    };
++
++    fn temp_root() -> PathBuf {
++        static NEXT: AtomicU32 = AtomicU32::new(0);
++        let dir = std::env::temp_dir().join(format!(
++            "horizon-profile-screen-test-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    fn enabled(screen: &Screen, id: u8) -> bool {
++        screen
++            .buttons(800.0, 600.0)
++            .iter()
++            .find(|b| b.5 == id)
++            .is_some_and(|b| b.4)
++    }
++
++    fn type_name(screen: &mut Screen, text: &str) {
++        screen.type_text(text);
++    }
++
++    #[test]
++    fn the_default_profile_is_the_only_one_at_first() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let screen = Screen::list(&profiles, "default");
++        assert!(!enabled(&screen, USE), "already in use");
++        assert!(enabled(&screen, NEW));
++        assert!(!enabled(&screen, RENAME), "the built-in one keeps its name");
++        assert!(!enabled(&screen, DELETE));
++        let mut screen = screen;
++        assert_eq!(screen.click(BACK, &mut profiles), Outcome::Back);
++    }
++
++    #[test]
++    fn a_new_profile_is_named_saved_and_listed() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let mut screen = Screen::list(&profiles, "default");
++        screen.click(NEW, &mut profiles);
++        assert!(screen.typing());
++        assert!(!enabled(&screen, SAVE), "no name yet");
++        type_name(&mut screen, "Ana");
++        assert!(enabled(&screen, SAVE));
++        assert_eq!(screen.click(SAVE, &mut profiles), Outcome::None);
++        match &screen {
++            Screen::List { profiles: all, .. } => {
++                assert_eq!(all.len(), 2);
++                assert_eq!(all[1].name, "Ana");
++            }
++            other => panic!("expected the list, got {other:?}"),
++        }
++        assert!(root.join("profiles/profile-1").is_dir());
++    }
++
++    #[test]
++    fn a_taken_name_stays_on_the_edit_screen_with_the_reason() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        profiles.create("Ana").unwrap();
++        let mut screen = Screen::list(&profiles, "default");
++        screen.click(NEW, &mut profiles);
++        type_name(&mut screen, "ana");
++        screen.click(SAVE, &mut profiles);
++        match &screen {
++            Screen::Edit { error, .. } => assert!(error.is_some()),
++            other => panic!("expected the edit screen, got {other:?}"),
++        }
++        // Typing again clears the message.
++        screen.type_text("x");
++        assert!(matches!(&screen, Screen::Edit { error: None, .. }));
++    }
++
++    #[test]
++    fn using_a_profile_makes_it_active_and_asks_to_switch() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let ana = profiles.create("Ana").unwrap();
++        let mut screen = Screen::list(&profiles, "default");
++        screen.select(1);
++        assert!(enabled(&screen, USE));
++        assert_eq!(
++            screen.click(USE, &mut profiles),
++            Outcome::Switch(ana.id.clone())
++        );
++        assert_eq!(Profiles::load(&root).active(), ana);
++        assert!(!enabled(&screen, USE), "now in use");
++        assert!(
++            !enabled(&screen, DELETE),
++            "the profile in use can't be deleted"
++        );
++        assert!(enabled(&screen, RENAME));
++    }
++
++    #[test]
++    fn deleting_needs_a_confirmation() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        profiles.create("Ana").unwrap();
++        let mut screen = Screen::list(&profiles, "default");
++        screen.select(1);
++        screen.click(DELETE, &mut profiles);
++        assert!(matches!(screen, Screen::ConfirmDelete { .. }));
++        // Cancel keeps it.
++        screen.click(CANCEL, &mut profiles);
++        assert_eq!(Profiles::load(&root).list().len(), 2);
++        screen.select(1);
++        screen.click(DELETE, &mut profiles);
++        screen.click(CONFIRM, &mut profiles);
++        assert_eq!(Profiles::load(&root).list().len(), 1);
++        assert!(matches!(screen, Screen::List { .. }));
++        assert!(!root.join("profiles/profile-1").exists());
++    }
++
++    #[test]
++    fn rename_starts_from_the_current_name_and_escape_steps_back() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        profiles.create("Ana").unwrap();
++        let mut screen = Screen::list(&profiles, "default");
++        screen.select(1);
++        screen.click(RENAME, &mut profiles);
++        match &screen {
++            Screen::Edit { id, name, .. } => {
++                assert_eq!(id.as_deref(), Some("profile-1"));
++                assert_eq!(name, "Ana");
++            }
++            other => panic!("expected the edit screen, got {other:?}"),
++        }
++        screen.backspace();
++        screen.type_text("ita");
++        screen.click(SAVE, &mut profiles);
++        assert_eq!(Profiles::load(&root).list()[1].name, "Anita");
++        // Escape: from a sub-screen back to the list, from the list out.
++        screen.click(NEW, &mut profiles);
++        assert!(!screen.escape(&profiles));
++        assert!(screen.escape(&profiles));
++    }
++
++    #[test]
++    fn typing_stops_at_the_longest_name_and_skips_control_characters() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let mut screen = Screen::list(&profiles, "default");
++        screen.click(NEW, &mut profiles);
++        screen.type_text(&"x".repeat(100));
++        screen.type_text("\n\t");
++        match &screen {
++            Screen::Edit { name, .. } => {
++                assert_eq!(name.chars().count(), profile::MAX_NAME_CHARS);
++            }
++            other => panic!("expected the edit screen, got {other:?}"),
++        }
++    }
++}
+-- 
+2.43.0
+
+
+From baf8145e24fd5baacf02b465f16c89f6e9b03e57 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 17:08:49 +0000
+Subject: [PATCH 3/6] Show the profile picker from the title screen (iOS)
+
+A new Mode::Profiles screen, reached from a small "P" button next to the
+title's icon buttons (iOS only, so desktop layout is untouched). It lists
+the profiles, selects rows by tap, and creates, renames, deletes and picks
+the profile for the next launch. profile::running() tells the screen which
+profile this run is in, so the running one can't be deleted.
+
+Choosing a profile only records it for the next launch; moving the running
+game into it is the next change.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game/agent.rs     |   1 +
+ crates/horizon-client/src/main.rs           |  10 +-
+ crates/horizon-client/src/profile.rs        |  13 +
+ crates/horizon-client/src/profile_screen.rs | 274 ++++++++++++++++++--
+ crates/horizon-client/src/title.rs          |  55 ++++
+ 5 files changed, 330 insertions(+), 23 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/agent.rs b/crates/horizon-client/src/game/agent.rs
+index 163844f..72576fb 100644
+--- a/crates/horizon-client/src/game/agent.rs
++++ b/crates/horizon-client/src/game/agent.rs
+@@ -590,6 +590,7 @@ impl Game<'_> {
+                 json!({ "mode": "multiplayer", "disconnected": reason })
+             }
+             Mode::Multiplayer(_) => json!({ "mode": "multiplayer" }),
++            Mode::Profiles(_) => json!({ "mode": "profiles" }),
+         }
+     }
+ 
+diff --git a/crates/horizon-client/src/main.rs b/crates/horizon-client/src/main.rs
+index d85ef90..b68874c 100644
+--- a/crates/horizon-client/src/main.rs
++++ b/crates/horizon-client/src/main.rs
+@@ -23,10 +23,14 @@ fn main() {
+     // A profile other than the built-in one keeps its own options, saves and
+     // packs in a folder of its own; logs stay in `home`.
+     #[cfg(target_os = "ios")]
+-    if let Some(dir) = horizon_client::profile::Profiles::load(&home).active_dir()
+-        && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir))
+     {
+-        eprintln!("Horizon: {}: {e}", dir.display());
++        let profiles = horizon_client::profile::Profiles::load(&home);
++        if let Some(dir) = profiles.active_dir() {
++            match std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir)) {
++                Ok(()) => horizon_client::profile::set_running(&profiles.active().id),
++                Err(e) => eprintln!("Horizon: {}: {e}", dir.display()),
++            }
++        }
+     }
+     if !help {
+         logging::init(&home, thread);
+diff --git a/crates/horizon-client/src/profile.rs b/crates/horizon-client/src/profile.rs
+index f3b4327..d7e8365 100644
+--- a/crates/horizon-client/src/profile.rs
++++ b/crates/horizon-client/src/profile.rs
+@@ -28,6 +28,19 @@ pub const DEFAULT_NAME: &str = "Default";
+ pub const MAX_NAME_CHARS: usize = 32;
+ const ID_PREFIX: &str = "profile-";
+ 
++/// The profile this run of the game is in (the built-in one until `main` enters
++/// another).
++static RUNNING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
++
++pub fn set_running(id: &str) {
++    *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = id.to_owned();
++}
++
++pub fn running() -> String {
++    let id = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).clone();
++    if id.is_empty() { DEFAULT_ID.into() } else { id }
++}
++
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct Profile {
+     pub id: String,
+diff --git a/crates/horizon-client/src/profile_screen.rs b/crates/horizon-client/src/profile_screen.rs
+index 05cd7ce..559b6a3 100644
+--- a/crates/horizon-client/src/profile_screen.rs
++++ b/crates/horizon-client/src/profile_screen.rs
+@@ -2,6 +2,7 @@
+ //! typed, the delete confirmation, and what each button asks for. It draws
+ //! nothing and starts nothing; the title screen shows it and acts on its
+ //! [`Outcome`], as it does for `multiplayer::Screen`.
++use crate::hud::{HudAtlas, HudBatch, rgba};
+ use crate::profile::{self, Profile, Profiles};
+ 
+ /// A button: x, y, width, label, enabled, id (the shape `multiplayer` uses).
+@@ -16,6 +17,13 @@ pub const SAVE: u8 = 5;
+ pub const CANCEL: u8 = 6;
+ pub const CONFIRM: u8 = 7;
+ 
++/// The list's rows: where it starts and how tall each is.
++const LIST_TOP: f32 = 36.0;
++const ROW_HEIGHT: f32 = 20.0;
++/// The space under the list: the message line and the buttons.
++const LIST_BOTTOM_GAP: f32 = 142.0;
++const ROW_WIDTH: f32 = 200.0;
++
+ /// What a click asks the title screen to do.
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum Outcome {
+@@ -27,13 +35,15 @@ pub enum Outcome {
+     Switch(String),
+ }
+ 
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub enum Screen {
+     List {
+         profiles: Vec<Profile>,
+         selected: usize,
+-        /// The id of the profile the game is in.
+-        current: String,
++        /// The profile this run of the game is in.
++        running: String,
++        /// The profile the game starts in (the one chosen with Use).
++        active: String,
+         /// Why the last button did nothing (a folder that could not be made).
+         error: Option<String>,
+     },
+@@ -42,22 +52,27 @@ pub enum Screen {
+         id: Option<String>,
+         name: String,
+         error: Option<String>,
++        running: String,
+     },
+     ConfirmDelete {
+         id: String,
+         name: String,
++        running: String,
+     },
+ }
+ 
+ impl Screen {
+-    /// The picker, with the profile the game is in selected.
+-    pub fn list(profiles: &Profiles, current: &str) -> Self {
++    /// The picker, with the profile the game starts in selected. `running` is
++    /// the profile this run is in.
++    pub fn list(profiles: &Profiles, running: &str) -> Self {
+         let all = profiles.list();
+-        let selected = all.iter().position(|p| p.id == current).unwrap_or(0);
++        let active = profiles.active().id;
++        let selected = all.iter().position(|p| p.id == active).unwrap_or(0);
+         Self::List {
+             profiles: all,
+             selected,
+-            current: current.to_owned(),
++            running: running.to_owned(),
++            active,
+             error: None,
+         }
+     }
+@@ -71,12 +86,14 @@ impl Screen {
+             Self::List {
+                 profiles,
+                 selected,
+-                current,
++                running,
++                active,
+                 ..
+             } => {
+                 let chosen = profiles.get(*selected);
+                 let custom = chosen.is_some_and(|p| !p.is_default());
+-                let in_use = chosen.is_some_and(|p| p.id == *current);
++                let in_use = chosen.is_some_and(|p| p.id == *active);
++                let busy = chosen.is_some_and(|p| p.id == *active || p.id == *running);
+                 vec![
+                     (
+                         x,
+@@ -93,7 +110,7 @@ impl Screen {
+                         bottom - 48.0,
+                         98.0,
+                         text("Delete"),
+-                        custom && !in_use,
++                        custom && !busy,
+                         DELETE,
+                     ),
+                     (x, bottom - 24.0, 200.0, text("Back"), true, BACK),
+@@ -136,20 +153,22 @@ impl Screen {
+                 Self::List {
+                     profiles: all,
+                     selected,
+-                    current,
++                    active,
+                     error,
++                    ..
+                 },
+                 USE,
+             ) => {
+                 let Some(target) = all.get(*selected).cloned() else {
+                     return Outcome::None;
+                 };
+-                if target.id == *current {
++                if target.id == *active {
+                     return Outcome::None;
+                 }
+                 match profiles.set_active(&target.id) {
+                     Ok(()) => {
+-                        *current = target.id.clone();
++                        *active = target.id.clone();
++                        *error = None;
+                         Outcome::Switch(target.id)
+                     }
+                     Err(e) => {
+@@ -158,11 +177,12 @@ impl Screen {
+                     }
+                 }
+             }
+-            (Self::List { .. }, NEW) => {
++            (Self::List { running, .. }, NEW) => {
+                 *self = Self::Edit {
+                     id: None,
+                     name: String::new(),
+                     error: None,
++                    running: running.clone(),
+                 };
+                 Outcome::None
+             }
+@@ -170,6 +190,7 @@ impl Screen {
+                 Self::List {
+                     profiles: all,
+                     selected,
++                    running,
+                     ..
+                 },
+                 RENAME,
+@@ -179,6 +200,7 @@ impl Screen {
+                         id: Some(p.id.clone()),
+                         name: p.name.clone(),
+                         error: None,
++                        running: running.clone(),
+                     };
+                 }
+                 Outcome::None
+@@ -187,23 +209,30 @@ impl Screen {
+                 Self::List {
+                     profiles: all,
+                     selected,
+-                    current,
++                    running,
++                    active,
+                     ..
+                 },
+                 DELETE,
+             ) => {
+                 if let Some(p) = all
+                     .get(*selected)
+-                    .filter(|p| !p.is_default() && p.id != *current)
++                    .filter(|p| !p.is_default() && p.id != *active && p.id != *running)
+                 {
+                     *self = Self::ConfirmDelete {
+                         id: p.id.clone(),
+                         name: p.name.clone(),
++                        running: running.clone(),
+                     };
+                 }
+                 Outcome::None
+             }
+-            (Self::Edit { id, name, error }, SAVE) => {
++            (
++                Self::Edit {
++                    id, name, error, ..
++                },
++                SAVE,
++            ) => {
+                 let saved = match id {
+                     Some(id) => profiles.rename(id, name),
+                     None => profiles.create(name).map(|_| ()),
+@@ -273,10 +302,153 @@ impl Screen {
+         }
+     }
+ 
+-    /// Back to the list, with the current profile selected again.
++    /// How many rows the list shows in a window `h` tall.
++    fn capacity(h: f32) -> usize {
++        (((h - LIST_BOTTOM_GAP - LIST_TOP) / ROW_HEIGHT)
++            .floor()
++            .max(1.0)) as usize
++    }
++
++    /// The first row shown, so that the selected one is in view.
++    pub fn first_visible(selected: usize, capacity: usize, len: usize) -> usize {
++        let first = (selected + 1).saturating_sub(capacity);
++        first.min(len.saturating_sub(capacity))
++    }
++
++    /// The row under a click at (`x`, `y`), in a window of `w` by `h`.
++    pub fn row_at(&self, x: f32, y: f32, (w, h): (f32, f32)) -> Option<usize> {
++        let Self::List {
++            profiles, selected, ..
++        } = self
++        else {
++            return None;
++        };
++        let left = (w / 2.0).floor() - ROW_WIDTH / 2.0;
++        let capacity = Self::capacity(h);
++        let first = Self::first_visible(*selected, capacity, profiles.len());
++        if x < left || x >= left + ROW_WIDTH || y < LIST_TOP {
++            return None;
++        }
++        let row = ((y - LIST_TOP) / ROW_HEIGHT) as usize;
++        (row < capacity && first + row < profiles.len()).then_some(first + row)
++    }
++
++    /// Draws the picker over the title's panorama; the buttons are drawn by the
++    /// title, from [`Screen::buttons`].
++    pub fn draw(&self, atlas: &HudAtlas, batch: &mut HudBatch, blink: bool, (w, h): (f32, f32)) {
++        let cx = (w / 2.0).floor();
++        let left = cx - ROW_WIDTH / 2.0;
++        let white = u32::MAX;
++        let gray = rgba(160, 160, 160, 255);
++        let red = rgba(255, 85, 85, 255);
++        let centered = |batch: &mut HudBatch, text: &str, y: f32, color: u32| {
++            let width = HudBatch::text_width(atlas, text).ceil();
++            batch.text(atlas, text, cx - (width / 2.0).floor(), y, color, true);
++        };
++        match self {
++            Self::List {
++                profiles,
++                selected,
++                running,
++                active,
++                error,
++            } => {
++                centered(batch, "Profiles", 14.0, white);
++                let capacity = Self::capacity(h);
++                let first = Self::first_visible(*selected, capacity, profiles.len());
++                for (row, profile) in profiles.iter().skip(first).take(capacity).enumerate() {
++                    let y = LIST_TOP + row as f32 * ROW_HEIGHT;
++                    batch.fill(
++                        atlas,
++                        left,
++                        y,
++                        ROW_WIDTH,
++                        ROW_HEIGHT - 2.0,
++                        rgba(0, 0, 0, 140),
++                    );
++                    if first + row == *selected {
++                        for (x, y, w, h) in [
++                            (left, y, ROW_WIDTH, 1.0),
++                            (left, y + ROW_HEIGHT - 3.0, ROW_WIDTH, 1.0),
++                            (left, y, 1.0, ROW_HEIGHT - 2.0),
++                            (left + ROW_WIDTH - 1.0, y, 1.0, ROW_HEIGHT - 2.0),
++                        ] {
++                            batch.fill(atlas, x, y, w, h, white);
++                        }
++                    }
++                    batch.text(atlas, &profile.name, left + 6.0, y + 5.0, white, true);
++                    let note = if profile.id == *active && active == running {
++                        Some("in use")
++                    } else if profile.id == *active {
++                        Some("next launch")
++                    } else if profile.id == *running {
++                        Some("running")
++                    } else {
++                        None
++                    };
++                    if let Some(note) = note {
++                        let width = HudBatch::text_width(atlas, note).ceil();
++                        batch.text(
++                            atlas,
++                            note,
++                            left + ROW_WIDTH - 6.0 - width,
++                            y + 5.0,
++                            gray,
++                            true,
++                        );
++                    }
++                }
++                if let Some(error) = error {
++                    centered(batch, error, h - LIST_BOTTOM_GAP + 4.0, red);
++                }
++            }
++            Self::Edit {
++                id, name, error, ..
++            } => {
++                centered(
++                    batch,
++                    if id.is_some() {
++                        "New name"
++                    } else {
++                        "New profile"
++                    },
++                    36.0,
++                    white,
++                );
++                batch.fill(atlas, left, 50.0, ROW_WIDTH, ROW_HEIGHT, white);
++                batch.fill(
++                    atlas,
++                    left + 1.0,
++                    51.0,
++                    ROW_WIDTH - 2.0,
++                    ROW_HEIGHT - 2.0,
++                    rgba(0, 0, 0, 255),
++                );
++                batch.text(atlas, name, left + 5.0, 56.0, white, true);
++                if blink {
++                    let caret = left + 5.0 + HudBatch::text_width(atlas, name).ceil();
++                    batch.fill(atlas, caret, 55.0, 1.0, 10.0, white);
++                }
++                if let Some(error) = error {
++                    centered(batch, error, 80.0, red);
++                }
++            }
++            Self::ConfirmDelete { name, .. } => {
++                centered(batch, "Delete this profile?", 50.0, white);
++                centered(batch, name, 66.0, white);
++                centered(batch, "Its worlds and settings will be lost.", 82.0, gray);
++            }
++        }
++    }
++
++    /// Back to the list, with the profile the game starts in selected.
+     fn back_to_list(&mut self, profiles: &Profiles) {
+-        let current = profiles.active().id;
+-        *self = Self::list(profiles, &current);
++        let running = match self {
++            Self::List { running, .. }
++            | Self::Edit { running, .. }
++            | Self::ConfirmDelete { running, .. } => running.clone(),
++        };
++        *self = Self::list(profiles, &running);
+     }
+ }
+ 
+@@ -309,6 +481,68 @@ mod tests {
+             .is_some_and(|b| b.4)
+     }
+ 
++    #[test]
++    fn the_list_scrolls_to_keep_the_selected_row_in_view() {
++        assert_eq!(Screen::first_visible(0, 5, 3), 0);
++        assert_eq!(Screen::first_visible(4, 5, 12), 0);
++        assert_eq!(Screen::first_visible(5, 5, 12), 1);
++        assert_eq!(Screen::first_visible(11, 5, 12), 7);
++        assert_eq!(Screen::first_visible(0, 5, 0), 0);
++    }
++
++    #[test]
++    fn rows_are_found_from_a_click() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        profiles.create("Ana").unwrap();
++        let screen = Screen::list(&profiles, "default");
++        let size = (800.0, 600.0);
++        assert_eq!(screen.row_at(400.0, LIST_TOP + 2.0, size), Some(0));
++        assert_eq!(
++            screen.row_at(400.0, LIST_TOP + ROW_HEIGHT + 2.0, size),
++            Some(1)
++        );
++        assert_eq!(
++            screen.row_at(400.0, LIST_TOP + 2.0 * ROW_HEIGHT + 2.0, size),
++            None
++        );
++        assert_eq!(
++            screen.row_at(10.0, LIST_TOP + 2.0, size),
++            None,
++            "left of the rows"
++        );
++        assert_eq!(screen.row_at(400.0, 5.0, size), None, "above the rows");
++    }
++
++    #[test]
++    fn a_chosen_profile_applies_at_the_next_launch_and_cannot_be_deleted_while_running() {
++        let root = temp_root();
++        let mut profiles = Profiles::load(&root);
++        let ana = profiles.create("Ana").unwrap();
++        // The game runs in Ana; the next launch is the built-in profile.
++        let mut screen = Screen::list(&profiles, &ana.id);
++        screen.select(1);
++        assert!(!enabled(&screen, DELETE), "the running profile stays");
++        assert!(enabled(&screen, USE), "chosen for the next launch");
++        assert_eq!(
++            screen.click(USE, &mut profiles),
++            Outcome::Switch(ana.id.clone())
++        );
++        assert!(!enabled(&screen, USE));
++        // Choosing the built-in profile again.
++        screen.select(0);
++        assert_eq!(
++            screen.click(USE, &mut profiles),
++            Outcome::Switch("default".into())
++        );
++        assert!(Profiles::load(&root).active().is_default());
++        // Still running in Ana: it can't be deleted until the game moves out.
++        screen.select(1);
++        assert!(!enabled(&screen, DELETE));
++        screen.click(DELETE, &mut profiles);
++        assert!(matches!(screen, Screen::List { .. }));
++    }
++
+     fn type_name(screen: &mut Screen, text: &str) {
+         screen.type_text(text);
+     }
+diff --git a/crates/horizon-client/src/title.rs b/crates/horizon-client/src/title.rs
+index 609637d..8cb4a11 100644
+--- a/crates/horizon-client/src/title.rs
++++ b/crates/horizon-client/src/title.rs
+@@ -101,6 +101,8 @@ pub enum Mode {
+         return_to: Box<Mode>,
+     },
+     Multiplayer(crate::multiplayer::Screen),
++    /// The profile picker (iOS: one game folder per player).
++    Profiles(crate::profile_screen::Screen),
+ }
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum Action {
+@@ -614,6 +616,9 @@ impl Title {
+                     button.icon = Some((icon, size));
+                     buttons.push(button);
+                 }
++                // Profiles: its own screen, after the three icon buttons.
++                #[cfg(target_os = "ios")]
++                buttons.push(b(cx - 34.0 + 3.0 * 24.0, y + 72.0, 20.0, "P", true, 8));
+                 buttons
+             }
+             Mode::Select { selected, .. } => vec![
+@@ -763,6 +768,11 @@ impl Title {
+                 .into_iter()
+                 .map(|(x, y, bw, label, enabled, id)| b(x, y, bw, &label, enabled, id))
+                 .collect(),
++            Mode::Profiles(screen) => screen
++                .buttons(w, h)
++                .into_iter()
++                .map(|(x, y, bw, label, enabled, id)| b(x, y, bw, &label, enabled, id))
++                .collect(),
+         }
+     }
+     pub fn draw(
+@@ -1076,6 +1086,12 @@ impl Title {
+                 (self.started.elapsed().as_millis() / 300).is_multiple_of(2),
+                 cursor,
+             ),
++            Mode::Profiles(screen) => screen.draw(
++                atlas,
++                batch,
++                (self.started.elapsed().as_millis() / 300).is_multiple_of(2),
++                (w, h),
++            ),
+         }
+         for b in self.buttons(w, h) {
+             crate::widgets::record(&b.label, [b.x, b.y, b.w, 20.0], b.enabled);
+@@ -1205,6 +1221,32 @@ impl Title {
+                 self.mode = Mode::Multiplayer(crate::multiplayer::Screen::friend());
+                 Action::None
+             }
++            (Mode::Main, Some(8)) => {
++                let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++                self.mode = Mode::Profiles(crate::profile_screen::Screen::list(
++                    &profiles,
++                    &crate::profile::running(),
++                ));
++                Action::None
++            }
++            (Mode::Profiles(screen), hit) => {
++                let mut profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++                match hit {
++                    None => {
++                        if let Some(row) = screen.row_at(x, y, (w, h)) {
++                            screen.select(row);
++                        }
++                    }
++                    Some(id) => match screen.click(id, &mut profiles) {
++                        crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
++                        // The choice is kept for the next launch; moving the
++                        // running game into it is a later change.
++                        crate::profile_screen::Outcome::Switch(_)
++                        | crate::profile_screen::Outcome::None => {}
++                    },
++                }
++                Action::None
++            }
+             (Mode::Main, Some(3)) => Action::Options,
+             (Mode::Main, Some(7)) => Action::Accessibility,
+             (Mode::Main, Some(6)) => Action::Language,
+@@ -1375,6 +1417,7 @@ impl Title {
+             Mode::Edit { focused, .. } => *focused,
+             Mode::Create { focus, .. } => *focus < 2,
+             Mode::Multiplayer(screen) => screen.typing(),
++            Mode::Profiles(screen) => screen.typing(),
+             _ => false,
+         }
+     }
+@@ -1402,12 +1445,18 @@ impl Title {
+         if let Mode::Multiplayer(screen) = &mut self.mode {
+             return screen.type_text(text);
+         }
++        if let Mode::Profiles(screen) = &mut self.mode {
++            return screen.type_text(text);
++        }
+         self.edit_field(|edit| edit.insert_text(text));
+     }
+     pub fn backspace(&mut self) {
+         if let Mode::Multiplayer(screen) = &mut self.mode {
+             return screen.backspace();
+         }
++        if let Mode::Profiles(screen) = &mut self.mode {
++            return screen.backspace();
++        }
+         self.field_key(winit::keyboard::KeyCode::Backspace, false, false);
+     }
+     /// EditBox.keyPressed: moving and deleting in the focused field.
+@@ -1552,6 +1601,12 @@ impl Title {
+         {
+             return;
+         }
++        if let Mode::Profiles(screen) = &mut self.mode {
++            let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++            if !screen.escape(&profiles) {
++                return;
++            }
++        }
+         match &self.mode {
+             Mode::Backup { .. } => {}
+             Mode::Edit { world, .. } | Mode::Delete { world } => {
+-- 
+2.43.0
+
+
+From 7835afe5fc894a8ae05e8ad108abba85d86deb61 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 17:14:56 +0000
+Subject: [PATCH 4/6] Switch profiles from the startup menu without restarting
+
+Choosing a profile in the startup menu now moves the running game into it:
+the profile being left keeps its changed options, the working directory
+becomes the new profile's folder, options.txt is read again (language, GUI
+scale, window), the title's saves and last server follow, and the resource
+loader restarts with the new profile's packs. Past the startup menu the
+choice is still kept for the next launch.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/game.rs             |  2 +
+ .../horizon-client/src/game/startup_menu.rs   | 41 +++++++++++++++++++
+ crates/horizon-client/src/title.rs            | 38 ++++++++++++-----
+ crates/horizon-client/src/title/tests.rs      | 33 +++++++++++++++
+ 4 files changed, 103 insertions(+), 11 deletions(-)
+
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 7cc62fc..7fa2628 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -11433,6 +11433,8 @@ impl ApplicationHandler for Game<'_> {
+                             self.connect_server(&address, &self.options.player_name())?
+                         }
+                         Action::None => {}
++                        // Only the startup menu moves the game into a profile.
++                        Action::SwitchProfile { .. } => {}
+                     }
+                 }
+                 WindowEvent::MouseInput { .. } if self.title.is_some() => {}
+diff --git a/crates/horizon-client/src/game/startup_menu.rs b/crates/horizon-client/src/game/startup_menu.rs
+index c0f833c..8d540eb 100644
+--- a/crates/horizon-client/src/game/startup_menu.rs
++++ b/crates/horizon-client/src/game/startup_menu.rs
+@@ -76,12 +76,17 @@ impl StartupMenu {
+                 &self.root,
+             );
+             title.last_server = settings.file.string("lastServer");
++            title.live_profile_switch = true;
+             self.title = Some(title);
+         }
+     }
+ 
+     pub(super) fn handoff(&mut self, game: &mut Game<'_>) {
+         game.title = self.title.take();
++        // Past the startup menu a profile can only be chosen for the next launch.
++        if let Some(title) = &mut game.title {
++            title.live_profile_switch = false;
++        }
+         game.pending_entry = self.pending.take();
+         game.cursor = self.cursor;
+         game.modifiers = self.modifiers;
+@@ -417,6 +422,7 @@ impl Loading {
+             Action::Options => self.open_menu_options(Page::Main),
+             Action::Accessibility => self.open_menu_options(Page::Accessibility),
+             Action::Language => self.open_menu_options(Page::Language),
++            Action::SwitchProfile { id } => self.switch_profile(&id),
+             action => {
+                 let name = self
+                     .options
+@@ -428,6 +434,41 @@ impl Loading {
+         self.save_menu_address();
+     }
+ 
++    /// Moves the running game into another profile's folder: its options, saves,
++    /// servers and resource packs replace the current ones, and the resources
++    /// load again. What changed in the profile being left stays in it.
++    fn switch_profile(&mut self, id: &str) {
++        if id == horizon_client::profile::running() {
++            return;
++        }
++        let profiles =
++            horizon_client::profile::Profiles::load(&horizon_client::logging::game_home());
++        let Some(profile) = profiles.list().into_iter().find(|p| p.id == id) else {
++            return;
++        };
++        self.save_menu_settings();
++        let dir = profiles.dir(&profile);
++        if let Err(error) =
++            std::fs::create_dir_all(&dir).and_then(|()| std::env::set_current_dir(&dir))
++        {
++            log::warn!("Horizon: profile {}: {error}", dir.display());
++            return;
++        }
++        horizon_client::profile::set_running(id);
++        self.settings = Settings::load(&Game::options_path());
++        horizon_client::lang::set(horizon_client::lang::Language::load(
++            &[&self.menu.root],
++            &self.settings.language,
++        ));
++        self.apply_menu_settings();
++        if let Some(title) = &mut self.menu.title {
++            title.saves = dir.join("saves");
++            title.last_server = self.settings.file.string("lastServer");
++        }
++        self.menu.options_open = false;
++        self.menu.reload_packs = true;
++    }
++
+     /// The startup menu's focused field: an options search box, or a title field.
+     pub(super) fn typing_field(&self) -> Option<Field> {
+         let menu = &self.menu;
+diff --git a/crates/horizon-client/src/title.rs b/crates/horizon-client/src/title.rs
+index 8cb4a11..27ab67d 100644
+--- a/crates/horizon-client/src/title.rs
++++ b/crates/horizon-client/src/title.rs
+@@ -124,12 +124,21 @@ pub enum Action {
+     Connect {
+         address: String,
+     },
++    /// Move the running game into this profile (see `Title::live_profile_switch`).
++    SwitchProfile {
++        id: String,
++    },
+ }
+ pub struct Title {
+     pub mode: Mode,
+     /// Direct Connection's address, synchronized with `options.txt`'s `lastServer`.
+     pub last_server: String,
+     pub saves: PathBuf,
++    /// The game folder the profiles live in.
++    pub profiles_root: PathBuf,
++    /// Whether choosing a profile moves the running game into it (the startup
++    /// menu can) or only keeps the choice for the next launch.
++    pub live_profile_switch: bool,
+     pub started: std::time::Instant,
+     search: String,
+     search_focused: bool,
+@@ -233,6 +242,8 @@ impl Title {
+             mode,
+             last_server: String::new(),
+             saves,
++            profiles_root: crate::logging::game_home(),
++            live_profile_switch: false,
+             started: now,
+             search: String::new(),
+             search_focused: false,
+@@ -1222,7 +1233,7 @@ impl Title {
+                 Action::None
+             }
+             (Mode::Main, Some(8)) => {
+-                let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++                let profiles = crate::profile::Profiles::load(&self.profiles_root);
+                 self.mode = Mode::Profiles(crate::profile_screen::Screen::list(
+                     &profiles,
+                     &crate::profile::running(),
+@@ -1230,20 +1241,25 @@ impl Title {
+                 Action::None
+             }
+             (Mode::Profiles(screen), hit) => {
+-                let mut profiles = crate::profile::Profiles::load(&crate::logging::game_home());
+-                match hit {
++                let mut profiles = crate::profile::Profiles::load(&self.profiles_root);
++                let outcome = match hit {
+                     None => {
+                         if let Some(row) = screen.row_at(x, y, (w, h)) {
+                             screen.select(row);
+                         }
++                        crate::profile_screen::Outcome::None
+                     }
+-                    Some(id) => match screen.click(id, &mut profiles) {
+-                        crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
+-                        // The choice is kept for the next launch; moving the
+-                        // running game into it is a later change.
+-                        crate::profile_screen::Outcome::Switch(_)
+-                        | crate::profile_screen::Outcome::None => {}
+-                    },
++                    Some(id) => screen.click(id, &mut profiles),
++                };
++                match outcome {
++                    crate::profile_screen::Outcome::Back => self.mode = Mode::Main,
++                    // Without a live switch the choice is kept for the next launch.
++                    crate::profile_screen::Outcome::Switch(id) if self.live_profile_switch => {
++                        self.mode = Mode::Main;
++                        return Action::SwitchProfile { id };
++                    }
++                    crate::profile_screen::Outcome::Switch(_)
++                    | crate::profile_screen::Outcome::None => {}
+                 }
+                 Action::None
+             }
+@@ -1602,7 +1618,7 @@ impl Title {
+             return;
+         }
+         if let Mode::Profiles(screen) = &mut self.mode {
+-            let profiles = crate::profile::Profiles::load(&crate::logging::game_home());
++            let profiles = crate::profile::Profiles::load(&self.profiles_root);
+             if !screen.escape(&profiles) {
+                 return;
+             }
+diff --git a/crates/horizon-client/src/title/tests.rs b/crates/horizon-client/src/title/tests.rs
+index 357ab8a..023e95f 100644
+--- a/crates/horizon-client/src/title/tests.rs
++++ b/crates/horizon-client/src/title/tests.rs
+@@ -890,3 +890,36 @@ fn a_typed_field_name_focuses_its_box_and_a_wrong_one_changes_nothing() {
+     f.title.focus_field("name").unwrap();
+     assert!(matches!(f.title.mode, Mode::Edit { focused: true, .. }));
+ }
++
++#[test]
++fn choosing_a_profile_switches_only_where_the_menu_can() {
++    for live in [false, true] {
++        let mut f = Fixture::new();
++        let home = f.root.join("home");
++        let mut profiles = crate::profile::Profiles::load(&home);
++        let ana = profiles.create("Ana").unwrap();
++        f.title.profiles_root = home.clone();
++        f.title.live_profile_switch = live;
++        f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
++        let size = (480.0, 262.0);
++        // Tap the second row, then Use.
++        f.title.click(240.0, 58.0, size);
++        let use_button = f
++            .title
++            .buttons(size.0, size.1)
++            .into_iter()
++            .find(|b| b.id == crate::profile_screen::USE)
++            .unwrap();
++        assert!(use_button.enabled);
++        let (action, _) = f.title.click(use_button.x + 5.0, use_button.y + 5.0, size);
++        if live {
++            assert!(matches!(&action, Action::SwitchProfile { id } if *id == ana.id));
++            assert!(matches!(f.title.mode, Mode::Main));
++        } else {
++            assert!(matches!(action, Action::None));
++            assert!(matches!(f.title.mode, Mode::Profiles(_)));
++        }
++        // Either way the choice is kept for the next launch.
++        assert_eq!(crate::profile::Profiles::load(&home).active(), ana);
++    }
++}
+-- 
+2.43.0
+
+
+From 470d096b79126e123350415bf6765816c9cd3bec Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 23:45:28 +0000
+Subject: [PATCH 5/6] Show the system keyboard for the profile name box
+
+The profile picker's name box was a plain drawn rectangle, so no tap on it was
+a text-field tap (widgets::Kind::Field, which is what makes the touch layer ask
+for the system keyboard) and the title's fields only get the keyboard from such
+a tap. Opening New or Rename by tapping a button never asked for it.
+
+The name box is now registered as a text field and has its own typing field,
+Field::Profile, which opens the keyboard with its screen like the chat does and
+closes it when the box goes (Save, Cancel or Back). Enter saves, as the Save
+button does, and a keyboard put away comes back with a tap on the box. Typed
+text, backspace and the hardware keyboard keep their existing paths.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../horizon-client/src/game/startup_menu.rs   | 12 +++-
+ crates/horizon-client/src/game/typing.rs      | 59 ++++++++++++++++++-
+ crates/horizon-client/src/profile_screen.rs   | 12 ++++
+ crates/horizon-client/src/title.rs            | 20 +++++++
+ crates/horizon-client/src/title/tests.rs      | 57 ++++++++++++++++++
+ 5 files changed, 155 insertions(+), 5 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/startup_menu.rs b/crates/horizon-client/src/game/startup_menu.rs
+index 8d540eb..8279892 100644
+--- a/crates/horizon-client/src/game/startup_menu.rs
++++ b/crates/horizon-client/src/game/startup_menu.rs
+@@ -479,8 +479,14 @@ impl Loading {
+         } else {
+             menu.title
+                 .as_ref()
+-                .is_some_and(Title::typing)
+-                .then_some(Field::Title)
++                .filter(|title| title.typing())
++                .map(|title| {
++                    if title.editing_profile() {
++                        Field::Profile
++                    } else {
++                        Field::Title
++                    }
++                })
+         }
+     }
+ 
+@@ -500,7 +506,7 @@ impl Loading {
+                 let events = self.menu.options.key(&mut self.settings, atlas, key, None);
+                 self.menu_option_events(events);
+             }
+-            Field::Title => {
++            Field::Title | Field::Profile => {
+                 match edit {
+                     Edit::Text(text) => self.menu.title_edit(Some(&text), false),
+                     Edit::Backspace => self.menu.title_edit(None, true),
+diff --git a/crates/horizon-client/src/game/typing.rs b/crates/horizon-client/src/game/typing.rs
+index f1e9e85..16be60f 100644
+--- a/crates/horizon-client/src/game/typing.rs
++++ b/crates/horizon-client/src/game/typing.rs
+@@ -28,6 +28,8 @@ pub(super) enum Field {
+     Options,
+     /// The title screens' fields: world names and seeds, the world search, server addresses.
+     Title,
++    /// The profile picker's name box: a screen made for typing, so the keyboard opens with it.
++    Profile,
+ }
+ 
+ impl Field {
+@@ -36,7 +38,7 @@ impl Field {
+     fn opens_keyboard(self) -> bool {
+         matches!(
+             self,
+-            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock
++            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock | Field::Profile
+         )
+     }
+     /// Enter ends the typing here; on a sign or a book's page it starts the next line.
+@@ -202,7 +204,13 @@ impl Game<'_> {
+             Screen::Win => None,
+             Screen::CommandBlock => Some(Field::CommandBlock),
+             Screen::Options => Some(Field::Options),
+-            _ => self.title.is_some().then_some(Field::Title),
++            _ => self.title.as_ref().map(|title| {
++                if title.editing_profile() {
++                    Field::Profile
++                } else {
++                    Field::Title
++                }
++            }),
+         }
+     }
+ 
+@@ -213,6 +221,7 @@ impl Game<'_> {
+             Field::WorldOptions => self.world_options_typing(),
+             Field::Options => self.ui.options.typing(),
+             Field::Title => self.title.as_ref().is_some_and(|t| t.typing()),
++            Field::Profile => true,
+             _ => true,
+         };
+         focused.then_some(field)
+@@ -276,6 +285,14 @@ impl Game<'_> {
+                 }
+                 _ => self.title_edit(text, backspace),
+             },
++            Field::Profile => match &edit {
++                Edit::Enter => {
++                    if let Some(title) = self.title.as_mut() {
++                        title.confirm_edit();
++                    }
++                }
++                _ => self.title_edit(text, backspace),
++            },
+         }
+     }
+ 
+@@ -296,6 +313,12 @@ impl Game<'_> {
+                 self.options_shortcut(all);
+             }
+             Field::Title => self.title_shortcut(all),
++            Field::Profile => {
++                if let Some(title) = self.title.as_mut() {
++                    title.profile_clear();
++                }
++                return;
++            }
+         }
+         self.edit_field(field, Edit::Backspace);
+     }
+@@ -386,6 +409,37 @@ mod tests {
+         assert_eq!(keyboard.step(Some(Field::Chat)), None);
+     }
+ 
++    #[test]
++    fn the_profile_name_box_opens_the_keyboard_with_its_screen_and_closes_it_after() {
++        let mut keyboard = SystemKeyboard::default();
++        // Tapping New opens the screen: the keyboard comes up without a tap on the box.
++        assert_eq!(keyboard.step(None), None);
++        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
++        assert_eq!(keyboard.step(Some(Field::Profile)), None);
++        // What it types reaches the box, and Enter saves (it ends the typing).
++        let typed = keyboard.input(Some(Field::Profile), SystemInput::Typed(Some("A")));
++        assert_eq!(typed, Some((Field::Profile, Edit::Text("A".into()))));
++        let enter = keyboard.input(Some(Field::Profile), SystemInput::Typed(Some("\n")));
++        assert_eq!(enter, Some((Field::Profile, Edit::Enter)));
++        // Saving or cancelling leaves the box: the keyboard goes.
++        assert_eq!(keyboard.step(None), Some(false));
++        // Back in the box, it comes up again.
++        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
++    }
++
++    #[test]
++    fn a_keyboard_put_away_comes_back_with_a_tap_on_the_name_box() {
++        let mut keyboard = SystemKeyboard::default();
++        assert_eq!(keyboard.step(Some(Field::Profile)), Some(true));
++        // The iPad's hide key gives it up; only a tap asks again.
++        assert_eq!(
++            keyboard.input(Some(Field::Profile), SystemInput::Shown(false)),
++            None
++        );
++        assert_eq!(keyboard.step(Some(Field::Profile)), None);
++        assert_eq!(keyboard.request(Some(Field::Profile)), Some(true));
++    }
++
+     #[test]
+     fn a_field_focused_without_a_tap_waits_for_one() {
+         let mut keyboard = SystemKeyboard::default();
+@@ -447,6 +501,7 @@ mod tests {
+             (WorldOptions, false, false),
+             (Options, false, false),
+             (Title, false, false),
++            (Profile, true, false),
+         ];
+         for (field, opens, keeps) in policies {
+             assert_eq!(
+diff --git a/crates/horizon-client/src/profile_screen.rs b/crates/horizon-client/src/profile_screen.rs
+index 559b6a3..397c6ec 100644
+--- a/crates/horizon-client/src/profile_screen.rs
++++ b/crates/horizon-client/src/profile_screen.rs
+@@ -296,6 +296,13 @@ impl Screen {
+         }
+     }
+ 
++    /// Empties the name being typed.
++    pub fn clear_name(&mut self) {
++        if let Some(name) = self.name_mut() {
++            name.clear();
++        }
++    }
++
+     pub fn backspace(&mut self) {
+         if let Some(name) = self.name_mut() {
+             name.pop();
+@@ -415,6 +422,11 @@ impl Screen {
+                     36.0,
+                     white,
+                 );
++                // A text field for the touch layer: a tap on it asks for the keyboard.
++                crate::widgets::target_as(
++                    [left, 50.0, ROW_WIDTH, ROW_HEIGHT],
++                    crate::widgets::Kind::Field,
++                );
+                 batch.fill(atlas, left, 50.0, ROW_WIDTH, ROW_HEIGHT, white);
+                 batch.fill(
+                     atlas,
+diff --git a/crates/horizon-client/src/title.rs b/crates/horizon-client/src/title.rs
+index 27ab67d..3f8d6a0 100644
+--- a/crates/horizon-client/src/title.rs
++++ b/crates/horizon-client/src/title.rs
+@@ -1427,6 +1427,18 @@ impl Title {
+         }
+     }
+     /// A text field has the focus: typed text goes to it.
++    /// The profile picker's name box is open: the system keyboard comes up with it.
++    pub fn editing_profile(&self) -> bool {
++        matches!(&self.mode, Mode::Profiles(screen) if screen.typing())
++    }
++
++    /// Empties the profile's name box.
++    pub fn profile_clear(&mut self) {
++        if let Mode::Profiles(screen) = &mut self.mode {
++            screen.clear_name();
++        }
++    }
++
+     pub fn typing(&self) -> bool {
+         match &self.mode {
+             Mode::Select { .. } => self.search_focused,
+@@ -1543,6 +1555,14 @@ impl Title {
+         }
+     }
+     pub fn confirm_edit(&mut self) {
++        // Enter in the profile's name box saves it, as its Save button does.
++        if let Mode::Profiles(screen) = &mut self.mode {
++            if screen.typing() {
++                let mut profiles = crate::profile::Profiles::load(&self.profiles_root);
++                screen.click(crate::profile_screen::SAVE, &mut profiles);
++            }
++            return;
++        }
+         let Mode::Edit {
+             world,
+             name,
+diff --git a/crates/horizon-client/src/title/tests.rs b/crates/horizon-client/src/title/tests.rs
+index 023e95f..0535b99 100644
+--- a/crates/horizon-client/src/title/tests.rs
++++ b/crates/horizon-client/src/title/tests.rs
+@@ -923,3 +923,60 @@ fn choosing_a_profile_switches_only_where_the_menu_can() {
+         assert_eq!(crate::profile::Profiles::load(&home).active(), ana);
+     }
+ }
++
++#[test]
++fn the_profile_name_box_takes_typing_backspace_and_enter() {
++    let mut f = Fixture::new();
++    let home = f.root.join("home");
++    let profiles = crate::profile::Profiles::load(&home);
++    f.title.profiles_root = home.clone();
++    f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
++    assert!(!f.title.editing_profile(), "the list takes no typing");
++    let size = (480.0, 262.0);
++    let new = f
++        .title
++        .buttons(size.0, size.1)
++        .into_iter()
++        .find(|b| b.id == crate::profile_screen::NEW)
++        .unwrap();
++    f.title.click(new.x + 5.0, new.y + 5.0, size);
++    // New opens the name box: the game asks the system keyboard for it.
++    assert!(f.title.editing_profile());
++    assert!(f.title.typing());
++    f.title.type_text("Anaa");
++    f.title.backspace();
++    assert!(matches!(
++        &f.title.mode,
++        Mode::Profiles(crate::profile_screen::Screen::Edit { name, .. }) if name == "Ana"
++    ));
++    // Enter saves it and the box closes, so the keyboard goes.
++    f.title.confirm_edit();
++    assert!(!f.title.editing_profile());
++    let saved = crate::profile::Profiles::load(&home).list();
++    assert_eq!(saved.len(), 2);
++    assert_eq!(saved[1].name, "Ana");
++}
++
++#[test]
++fn cancelling_the_profile_name_box_closes_it_without_saving() {
++    let mut f = Fixture::new();
++    let home = f.root.join("home");
++    let profiles = crate::profile::Profiles::load(&home);
++    f.title.profiles_root = home.clone();
++    f.title.mode = Mode::Profiles(crate::profile_screen::Screen::list(&profiles, "default"));
++    let size = (480.0, 262.0);
++    let press = |f: &mut Fixture, id: u8| {
++        let b = f
++            .title
++            .buttons(size.0, size.1)
++            .into_iter()
++            .find(|b| b.id == id)
++            .unwrap();
++        f.title.click(b.x + 5.0, b.y + 5.0, size);
++    };
++    press(&mut f, crate::profile_screen::NEW);
++    f.title.type_text("Beto");
++    press(&mut f, crate::profile_screen::CANCEL);
++    assert!(!f.title.editing_profile());
++    assert_eq!(crate::profile::Profiles::load(&home).list().len(), 1);
++}
+-- 
+2.43.0
+
+
+From 624bf5cc5d07198ee65e2262c42c425c17a3a21d Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Sat, 7 Nov 2026 17:20:13 +0000
+Subject: [PATCH 6/6] winit iOS: expose the view's safe area insets
+
+WindowExtIOS::safe_area_insets returns safeAreaInsets of the window's view in
+physical pixels (notch, rounded corners, status bar, home indicator), so the
+game can keep touch controls clear of them. Nothing uses it yet.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+(cherry picked from commit c88e29b870055904880b59c6ab95d2186397dd0f)
+---
+ third_party/winit/src/platform/ios.rs         | 23 +++++++++++++++++++
+ .../winit/src/platform_impl/ios/window.rs     | 13 +++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/third_party/winit/src/platform/ios.rs b/third_party/winit/src/platform/ios.rs
+index 6e62876..48049ce 100644
+--- a/third_party/winit/src/platform/ios.rs
++++ b/third_party/winit/src/platform/ios.rs
+@@ -128,6 +128,14 @@ pub trait WindowExtIOS {
+     /// This only has an effect on iOS 11.0+.
+     fn set_prefers_home_indicator_hidden(&self, hidden: bool);
+ 
++    /// The parts of the [`Window`] that the notch, the rounded corners, the status bar or the
++    /// home indicator can cover, in physical pixels from each edge of the view.
++    ///
++    /// This is [`-[UIView safeAreaInsets]`](https://developer.apple.com/documentation/uikit/uiview/2891103-safeareainsets?language=objc)
++    /// of the window's view, rounded up to whole pixels. It changes when the device rotates, so
++    /// ask again after a `Resized`.
++    fn safe_area_insets(&self) -> SafeAreaInsets;
++
+     /// Sets the screen edges for which the system gestures will take a lower priority than the
+     /// application's touch handling.
+     ///
+@@ -194,6 +202,16 @@ pub trait WindowExtIOS {
+     fn recognize_rotation_gesture(&self, should_recognize: bool);
+ }
+ 
++/// How far the notch, the rounded corners and the system bars reach into the window, in
++/// physical pixels from each edge.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct SafeAreaInsets {
++    pub top: u32,
++    pub left: u32,
++    pub bottom: u32,
++    pub right: u32,
++}
++
+ impl WindowExtIOS for Window {
+     #[inline]
+     fn set_scale_factor(&self, scale_factor: f64) {
+@@ -210,6 +228,11 @@ impl WindowExtIOS for Window {
+         self.window.maybe_queue_on_main(move |w| w.set_prefers_home_indicator_hidden(hidden))
+     }
+ 
++    #[inline]
++    fn safe_area_insets(&self) -> SafeAreaInsets {
++        self.window.maybe_wait_on_main(|w| w.safe_area_insets())
++    }
++
+     #[inline]
+     fn set_preferred_screen_edges_deferring_system_gestures(&self, edges: ScreenEdge) {
+         self.window.maybe_queue_on_main(move |w| {
+diff --git a/third_party/winit/src/platform_impl/ios/window.rs b/third_party/winit/src/platform_impl/ios/window.rs
+index 0889897..48d2202 100644
+--- a/third_party/winit/src/platform_impl/ios/window.rs
++++ b/third_party/winit/src/platform_impl/ios/window.rs
+@@ -193,6 +193,19 @@ impl Inner {
+         size.to_physical(scale_factor)
+     }
+ 
++    /// `safeAreaInsets` of the view, in physical pixels (zero where nothing covers it).
++    pub fn safe_area_insets(&self) -> crate::platform::ios::SafeAreaInsets {
++        let scale = self.scale_factor();
++        let insets = self.view.safeAreaInsets();
++        let pixels = |points: f64| (points.max(0.0) * scale).ceil() as u32;
++        crate::platform::ios::SafeAreaInsets {
++            top: pixels(insets.top as f64),
++            left: pixels(insets.left as f64),
++            bottom: pixels(insets.bottom as f64),
++            right: pixels(insets.right as f64),
++        }
++    }
++
+     pub fn outer_size(&self) -> PhysicalSize<u32> {
+         let scale_factor = self.scale_factor();
+         let screen_frame = self.screen_frame();
+-- 
+2.43.0
+
