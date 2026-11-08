@@ -97,15 +97,41 @@ fn touch_event(touch: &Touch, here: Here) -> TouchEvent {
     }
 }
 
+/// The screen's notch, rounded corners and system bars, as the window has them now (none off iOS).
+fn screen_insets(window: &winit::window::Window) -> horizon_client::touch::config::Insets {
+    #[cfg(target_os = "ios")]
+    {
+        use winit::platform::ios::WindowExtIOS;
+        let insets = window.safe_area_insets();
+        horizon_client::touch::config::Insets {
+            top: insets.top as f32,
+            left: insets.left as f32,
+            bottom: insets.bottom as f32,
+            right: insets.right as f32,
+        }
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = window;
+        horizon_client::touch::config::Insets::default()
+    }
+}
+
+/// The touch configuration with the window's insets, which change as the device turns.
+fn touch_config(window: &winit::window::Window) -> horizon_client::touch::config::TouchConfig {
+    horizon_client::touch::config::set_insets(screen_insets(window));
+    horizon_client::touch::config::current()
+}
+
 impl Game<'_> {
     pub(super) fn touch_layout(&self) -> Option<Layout> {
         let r = self.renderer.as_ref()?;
-        let scale = self.window.as_ref()?.scale_factor();
+        let window = self.window.as_ref()?;
         Some(Layout::with_config(
             r.config.width,
             r.config.height,
-            scale,
-            horizon_client::touch::config::current(),
+            window.scale_factor(),
+            touch_config(window),
         ))
     }
 
@@ -604,7 +630,7 @@ impl Loading {
             r.config.width,
             r.config.height,
             window.scale_factor(),
-            horizon_client::touch::config::current(),
+            touch_config(window),
         );
         let scale = HudBatch::new([r.config.width, r.config.height]).scale;
         let p = (

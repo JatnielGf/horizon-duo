@@ -62,6 +62,11 @@ impl Control {
     fn index(self) -> usize {
         self as usize
     }
+    /// Whether it may be hidden. The D-pad moves the player and Pause and Back leave a menu, so
+    /// they stay where a finger can find them.
+    pub fn can_hide(self) -> bool {
+        !matches!(self, Control::DPad | Control::Pause | Control::Back)
+    }
 }
 
 /// What the player changed in one control.
@@ -148,9 +153,12 @@ impl TouchConfig {
         self.tweaks[control.index()]
     }
 
-    /// Changes one control; the values are brought into their ranges.
+    /// Changes one control; the values are brought into their ranges, and a control that can't be
+    /// hidden is not.
     pub fn set(&mut self, control: Control, tweak: Tweak) {
-        self.tweaks[control.index()] = tweak.sanitized();
+        let mut tweak = tweak.sanitized();
+        tweak.hidden &= control.can_hide();
+        self.tweaks[control.index()] = tweak;
     }
 
     /// Everything back to Pocket Edition's layout (the insets stay: they are the screen's).
@@ -275,8 +283,10 @@ pub fn set_current(config: TouchConfig) {
 /// The window's insets, as the screen has them now.
 pub fn set_insets(insets: Insets) {
     let mut config = current();
-    config.insets = insets;
-    *CURRENT.write().unwrap_or_else(PoisonError::into_inner) = Some(config);
+    if config.insets != insets {
+        config.insets = insets;
+        *CURRENT.write().unwrap_or_else(PoisonError::into_inner) = Some(config);
+    }
 }
 
 /// Forgets the configuration: the next one is read from the game folder, which is another when
@@ -415,6 +425,31 @@ mod tests {
         assert_eq!(base.fingerprint(), TouchConfig::default().fingerprint());
         assert_ne!(base.fingerprint(), moved.fingerprint());
         assert_ne!(base.fingerprint(), notched.fingerprint());
+    }
+
+    #[test]
+    fn only_the_controls_that_can_be_left_out_are_hidden() {
+        let hidden = Tweak {
+            hidden: true,
+            ..Tweak::default()
+        };
+        let mut config = TouchConfig::default();
+        for control in Control::ALL {
+            config.set(control, hidden);
+            assert_eq!(
+                config.tweak(control).hidden,
+                control.can_hide(),
+                "{control:?}"
+            );
+        }
+        // A file can't hide them either.
+        let all = r#"{"controls": {"dpad": {"hidden": true}, "pause": {"hidden": true},
+            "back": {"hidden": true}, "jump": {"hidden": true}}}"#;
+        let file = TouchConfig::from_json(all);
+        assert!(!file.tweak(Control::DPad).hidden);
+        assert!(!file.tweak(Control::Pause).hidden);
+        assert!(!file.tweak(Control::Back).hidden);
+        assert!(file.tweak(Control::Jump).hidden);
     }
 
     #[test]

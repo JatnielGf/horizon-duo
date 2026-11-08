@@ -149,6 +149,31 @@ impl Layout {
     fn u(&self, art: f32) -> f32 {
         art * self.unit
     }
+    /// The size of one art pixel of `control`: the screen's, as the player scaled it.
+    pub(super) fn unit_of(&self, control: Control) -> f32 {
+        let scaled = self.unit * self.config.scale * self.config.tweak(control).scale;
+        // Never past half the screen's height, so it still fits; never under the default.
+        let art = match control {
+            Control::DPad => 2.0 * PITCH + CELL,
+            Control::Jump => JUMP,
+            Control::Pause | Control::Back | Control::Chat => SMALL,
+            Control::Shift | Control::Caps => CELL,
+        };
+        let most = 0.5 * self.size[1] / art;
+        scaled.min(most.max(self.unit))
+    }
+    /// `art` pixels of `control`.
+    fn uc(&self, control: Control, art: f32) -> f32 {
+        art * self.unit_of(control)
+    }
+    /// How opaque `control` is drawn, from 0 to 1.
+    pub(super) fn opacity(&self, control: Control) -> f32 {
+        self.config.opacity * self.config.tweak(control).opacity
+    }
+    /// Whether the player left `control` out: it is not drawn and takes no touch.
+    pub(super) fn hidden(&self, control: Control) -> bool {
+        control.can_hide() && self.config.tweak(control).hidden
+    }
     /// A margin from an edge: Pocket Edition's, or where the notch, the rounded corners or the
     /// system bars reach further.
     fn margin(&self, inset: f32) -> f32 {
@@ -195,7 +220,7 @@ impl Layout {
     /// The D-pad's 3 x 3 squares in the bottom-left corner, raised above the hotbar where a
     /// narrow screen brings them together.
     pub(super) fn dpad(&self) -> Rect {
-        let side = self.u(2.0 * PITCH + CELL);
+        let side = self.uc(Control::DPad, 2.0 * PITCH + CELL);
         let x = self.margin(self.config.insets.left);
         let mut y = self.size[1] - self.margin(self.config.insets.bottom) - side;
         let [hx, hy, ..] = self.hotbar();
@@ -207,8 +232,9 @@ impl Layout {
     pub(super) fn cell(&self, cell: Cell) -> Rect {
         let [x, y, ..] = self.dpad();
         let (col, row) = cell.grid();
-        let pitch = self.u(PITCH);
-        [x + col * pitch, y + row * pitch, self.u(CELL), self.u(CELL)]
+        let pitch = self.uc(Control::DPad, PITCH);
+        let side = self.uc(Control::DPad, CELL);
+        [x + col * pitch, y + row * pitch, side, side]
     }
     /// The D-pad square under `at`, if `at` is on the D-pad.
     pub(super) fn cell_at(&self, at: [f32; 2]) -> Option<Cell> {
@@ -216,7 +242,7 @@ impl Layout {
         if !(x..x + side).contains(&at[0]) || !(y..y + side).contains(&at[1]) {
             return None;
         }
-        let pitch = self.u(PITCH);
+        let pitch = self.uc(Control::DPad, PITCH);
         let col = (((at[0] - x) / pitch) as i32).min(2);
         let row = (((at[1] - y) / pitch) as i32).min(2);
         Cell::at(col, row)
@@ -232,6 +258,9 @@ impl Layout {
             // Glued to the hotbar, which is Pocket Edition's.
             Button::Inventory => return rest,
         };
+        if self.hidden(control) {
+            return [0.0; 4];
+        }
         let moved = self.moved(control, rest);
         // Chat follows Pause, which can be anywhere: it stays in the safe area too.
         if button == Button::Chat {
@@ -257,7 +286,7 @@ impl Layout {
         let inset = self.config.insets;
         match button {
             Button::Jump => {
-                let side = self.u(JUMP);
+                let side = self.uc(Control::Jump, JUMP);
                 [
                     w - self.margin(inset.right) - side,
                     h - self.margin(inset.bottom) - side,
@@ -270,7 +299,7 @@ impl Layout {
                 [x + width + self.u(2.0), y, height, height]
             }
             Button::Pause => {
-                let side = self.u(SMALL);
+                let side = self.uc(Control::Pause, SMALL);
                 [
                     w - self.margin(inset.right) - side,
                     self.margin(inset.top),
@@ -279,11 +308,11 @@ impl Layout {
                 ]
             }
             Button::Back => {
-                let side = self.u(SMALL);
+                let side = self.uc(Control::Back, SMALL);
                 [self.margin(inset.left), self.margin(inset.top), side, side]
             }
             Button::Shift => {
-                let side = self.u(CELL);
+                let side = self.uc(Control::Shift, CELL);
                 [
                     self.margin(inset.left),
                     h - self.margin(inset.bottom) - side,
@@ -292,7 +321,7 @@ impl Layout {
                 ]
             }
             Button::Chat => {
-                let side = self.u(SMALL);
+                let side = self.uc(Control::Chat, SMALL);
                 let pause = self.button(Button::Pause);
                 let left = pause[0] - self.u(2.0) - side;
                 // Left of Pause, or right of it where there is no room on its left.
@@ -311,6 +340,7 @@ impl Layout {
     /// A key cap in a row along the top-left corner, or a tile of the panel.
     pub(super) fn control(&self, place: Place) -> Rect {
         match place {
+            Place::Cap(_) if self.hidden(Control::Caps) => [0.0; 4],
             Place::Cap(i) => {
                 let [x, y, side, _] = self.cap_at_rest(i);
                 let [dx, dy] = self.caps_shift();
@@ -332,7 +362,7 @@ impl Layout {
     /// Where key cap `i` rests, before the player's changes.
     fn cap_at_rest(&self, i: u8) -> Rect {
         let inset = self.config.insets;
-        let side = self.u(CELL).max(CAP_TEXT * self.gui);
+        let side = self.uc(Control::Caps, CELL).max(CAP_TEXT * self.gui);
         let x = self.margin(inset.left) + f32::from(i) * (side + self.u(2.0));
         [x, self.margin(inset.top), side, side]
     }
@@ -373,7 +403,7 @@ impl Layout {
         [x + side / 2.0, y + side / 2.0]
     }
     pub(super) fn reach(&self) -> f32 {
-        self.u(REACH)
+        self.uc(Control::DPad, REACH)
     }
     /// How far a finger may drift and still tap or hold.
     pub(super) fn slop(&self) -> f32 {
@@ -773,6 +803,167 @@ mod tests {
             let i = config.insets;
             let back = Layout::with_config(w, h, scale, config).button(Button::Back);
             assert!(back[0] >= i.left && back[1] >= i.top, "{w}x{h}: {back:?}");
+        }
+    }
+
+    #[test]
+    fn a_control_is_scaled_from_its_corner_and_its_touches_follow() {
+        let (w, h, scale) = (2622, 1206, 3.0);
+        let rest = Layout::new(w, h, scale);
+        let config = config_with(
+            Control::Jump,
+            Tweak {
+                scale: 1.5,
+                ..Tweak::default()
+            },
+        );
+        let big = Layout::with_config(w, h, scale, config);
+        let (a, b) = (rest.button(Button::Jump), big.button(Button::Jump));
+        assert!(
+            (b[2] - 1.5 * a[2]).abs() < 0.01,
+            "a side one and a half times as long"
+        );
+        // It grows from its corner, inward, so it still rests against the same margins.
+        assert!((b[0] + b[2] - (a[0] + a[2])).abs() < 0.01);
+        assert!((b[1] + b[3] - (a[1] + a[3])).abs() < 0.01);
+        assert!(
+            big.on(Button::Jump, [b[0] + 1.0, b[1] + 1.0]),
+            "its whole size takes the touch"
+        );
+        assert!(!rest.on(Button::Jump, [b[0] + 1.0, b[1] + 1.0]));
+        // The others stay as they were.
+        assert_eq!(rest.button(Button::Pause), big.button(Button::Pause));
+        assert_eq!(rest.dpad(), big.dpad());
+    }
+
+    #[test]
+    fn scaling_the_dpad_scales_its_squares_and_the_joystick() {
+        let (w, h, scale) = (2622, 1206, 3.0);
+        let rest = Layout::new(w, h, scale);
+        let config = config_with(
+            Control::DPad,
+            Tweak {
+                scale: 1.25,
+                ..Tweak::default()
+            },
+        );
+        let big = Layout::with_config(w, h, scale, config);
+        assert!((big.dpad()[2] - 1.25 * rest.dpad()[2]).abs() < 0.01);
+        assert!((big.reach() - 1.25 * rest.reach()).abs() < 0.01);
+        for cell in Cell::ALL {
+            let r = big.cell(cell);
+            let middle = [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
+            assert_eq!(big.cell_at(middle), Some(cell), "{cell:?}");
+        }
+    }
+
+    #[test]
+    fn a_control_never_grows_past_half_the_screens_height_nor_under_its_default() {
+        let (w, h, scale) = (2622, 1206, 3.0);
+        let rest = Layout::new(w, h, scale);
+        let config = config_with(
+            Control::DPad,
+            Tweak {
+                scale: 2.0,
+                ..Tweak::default()
+            },
+        );
+        let big = Layout::with_config(w, h, scale, config);
+        assert!(big.dpad()[2] <= 0.5 * h as f32 + 0.01, "{:?}", big.dpad());
+        assert!(big.dpad()[2] > rest.dpad()[2], "it did grow");
+        let config = config_with(
+            Control::Jump,
+            Tweak {
+                scale: 0.5,
+                ..Tweak::default()
+            },
+        );
+        let small = Layout::with_config(w, h, scale, config);
+        assert!((small.button(Button::Jump)[2] - 0.5 * rest.button(Button::Jump)[2]).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_global_scale_and_opacity_apply_to_every_control_on_top_of_their_own() {
+        let (w, h, scale) = (2622, 1206, 3.0);
+        let mut config = config_with(
+            Control::Jump,
+            Tweak {
+                scale: 2.0,
+                opacity: 0.5,
+                ..Tweak::default()
+            },
+        );
+        config.scale = 0.5;
+        config.opacity = 0.8;
+        let layout = Layout::with_config(w, h, scale, config);
+        let plain = Layout::new(w, h, scale);
+        assert!((layout.unit_of(Control::Jump) - plain.unit_of(Control::Jump)).abs() < 0.01);
+        assert!(
+            (layout.unit_of(Control::Pause) - 0.5 * plain.unit_of(Control::Pause)).abs() < 0.01
+        );
+        assert!((layout.opacity(Control::Jump) - 0.4).abs() < 1e-6);
+        assert!((layout.opacity(Control::Pause) - 0.8).abs() < 1e-6);
+        assert_eq!(plain.opacity(Control::Pause), 1.0);
+    }
+
+    #[test]
+    fn a_hidden_control_takes_no_touch_and_leaves_no_square() {
+        let (w, h, scale) = (2622, 1206, 3.0);
+        let rest = Layout::new(w, h, scale);
+        let hidden = Tweak {
+            hidden: true,
+            ..Tweak::default()
+        };
+        for (control, button) in [
+            (Control::Jump, Button::Jump),
+            (Control::Shift, Button::Shift),
+            (Control::Chat, Button::Chat),
+        ] {
+            let layout = Layout::with_config(w, h, scale, config_with(control, hidden));
+            let at = rest.button(button);
+            assert!(layout.hidden(control));
+            assert_eq!(layout.button(button), [0.0; 4]);
+            assert!(!layout.on(button, [at[0] + 2.0, at[1] + 2.0]), "{button:?}");
+        }
+        // The key caps go as a row.
+        let layout = Layout::with_config(w, h, scale, config_with(Control::Caps, hidden));
+        for control in CONTROLS.iter().filter(|c| matches!(c.place, Place::Cap(_))) {
+            assert_eq!(layout.control(control.place), [0.0; 4]);
+        }
+        // What moves the player and leaves a menu is always there.
+        let layout = Layout::with_config(w, h, scale, config_with(Control::DPad, hidden));
+        assert!(!layout.hidden(Control::DPad));
+        assert_eq!(layout.dpad(), rest.dpad());
+        let layout = Layout::with_config(w, h, scale, config_with(Control::Back, hidden));
+        assert_eq!(layout.button(Button::Back), rest.button(Button::Back));
+    }
+
+    #[test]
+    fn every_size_the_player_can_pick_still_fits_the_screen_and_the_safe_area() {
+        for (w, h, scale) in SCREENS {
+            for control in Control::ALL {
+                for factor in [0.5, 1.0, 2.0] {
+                    let mut config = config_with(
+                        control,
+                        Tweak {
+                            scale: factor,
+                            ..Tweak::default()
+                        },
+                    );
+                    config.insets = notched(scale);
+                    let i = config.insets;
+                    let layout = Layout::with_config(w, h, scale, config);
+                    for (name, r) in movable(&layout) {
+                        assert!(
+                            r[0] >= i.left - 0.01
+                                && r[1] >= i.top - 0.01
+                                && r[0] + r[2] <= w as f32 - i.right + 0.01
+                                && r[1] + r[3] <= h as f32 - i.bottom + 0.01,
+                            "{w}x{h}: the {name} at {factor}x of {control:?}: {r:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

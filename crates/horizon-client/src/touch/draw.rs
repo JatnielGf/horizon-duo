@@ -2,6 +2,7 @@
 //! pixel `Layout::unit` physical pixels wide, drawn into the HUD batch. Key caps and the Fn
 //! panel's tiles are written in the game's font instead.
 
+use super::config::Control as Part;
 use super::functions::Control;
 use super::layout::{Button, Cell, KNOB, Layout, Rect};
 use super::menu::{Gesture, Latch, MENU_HOLD, Pointer, hold_rings, hold_time};
@@ -139,28 +140,64 @@ fn pressed_plate() -> u32 {
     rgba(255, 255, 255, 120)
 }
 
+/// `color` with its alpha (the top byte) multiplied by `opacity`, from 0 to 1.
+fn fade(color: u32, opacity: f32) -> u32 {
+    if opacity >= 1.0 {
+        return color;
+    }
+    let alpha = ((color >> 24) as f32 * opacity.max(0.0)).round() as u32;
+    (color & 0x00ff_ffff) | alpha << 24
+}
+
 struct Pen<'a> {
     batch: &'a mut HudBatch,
     atlas: &'a HudAtlas,
     layout: &'a Layout,
+    /// The size of one art pixel and how opaque: the layout's, or those of the control being drawn.
+    unit: f32,
+    alpha: f32,
 }
 
 impl Pen<'_> {
+    /// `color` as opaque as the control being drawn.
+    fn faded(&self, color: u32) -> u32 {
+        fade(color, self.alpha)
+    }
+    /// Draws what follows as `part`: at its size and opacity.
+    fn part(&mut self, part: Part) {
+        self.unit = self.layout.unit_of(part);
+        self.alpha = self.layout.opacity(part);
+    }
+    /// Draws what follows as the game does.
+    fn plain(&mut self) {
+        self.unit = self.layout.unit;
+        self.alpha = 1.0;
+    }
+    /// A button of `part`, unless the player left it out.
+    fn part_button(&mut self, part: Part, r: Rect, pressed: bool, icon: Icon, turn: Turn) {
+        if self.layout.hidden(part) {
+            return;
+        }
+        self.part(part);
+        self.button(r, pressed, icon, turn);
+        self.plain();
+    }
     fn fill(&mut self, r: Rect, color: u32) {
         let g = self.layout.gui;
+        let color = self.faded(color);
         self.batch
             .fill(self.atlas, r[0] / g, r[1] / g, r[2] / g, r[3] / g, color);
     }
     /// A square with a one-pixel outline, lit while pressed.
     fn plate(&mut self, r: Rect, pressed: bool) {
-        let u = self.layout.unit;
+        let u = self.unit;
         self.fill(r, OUTLINE);
         let inner = [r[0] + u, r[1] + u, r[2] - 2.0 * u, r[3] - 2.0 * u];
         self.fill(inner, if pressed { pressed_plate() } else { PLATE });
     }
     /// `icon` in the middle of `r`, turned.
     fn icon(&mut self, r: Rect, icon: Icon, turn: Turn) {
-        let u = self.layout.unit;
+        let u = self.unit;
         let (rows, cols) = (icon.len() as f32, icon[0].len() as f32);
         let (w, h) = match turn {
             Turn::Left | Turn::Right => (rows, cols),
@@ -195,13 +232,14 @@ impl Pen<'_> {
         let g = self.layout.gui;
         let width = HudBatch::text_width(self.atlas, text);
         let x = ((r[0] + r[2] / 2.0) / g - width / 2.0).round();
+        let color = self.faded(color);
         self.batch
             .text(self.atlas, text, x, (top / g).round(), color, true);
     }
     /// A ring of dots around a finger at `at`, filling as it is held `held` of `hold`.
     fn ring(&mut self, at: [f64; 2], held: Duration, hold: Duration) {
         const DOTS: u32 = 12;
-        let u = self.layout.unit;
+        let u = self.unit;
         let lit = (held.as_secs_f32() / hold.as_secs_f32() * DOTS as f32) as u32;
         for i in 0..DOTS {
             let angle = i as f32 / DOTS as f32 * std::f32::consts::TAU;
@@ -215,7 +253,7 @@ impl Pen<'_> {
     }
     /// A disc of `radius` art pixels around `centre`, one row of pixels at a time.
     fn disc(&mut self, centre: [f32; 2], radius: f32, color: u32) {
-        let u = self.layout.unit;
+        let u = self.unit;
         let r = radius.round() as i32;
         for row in -r..r {
             let y = row as f32 + 0.5;
@@ -246,11 +284,19 @@ impl Touch {
             batch,
             atlas,
             layout,
+            unit: layout.unit,
+            alpha: 1.0,
         };
         match self.context.mode {
             Mode::Title => self.draw_menu(&mut pen, now),
             Mode::Menu => {
-                pen.button(layout.button(Button::Back), false, ARROW, Turn::Left);
+                pen.part_button(
+                    Part::Back,
+                    layout.button(Button::Back),
+                    false,
+                    ARROW,
+                    Turn::Left,
+                );
                 if self.context.slots {
                     let shift = self.menus.shift;
                     let icon = match shift.latch {
@@ -258,22 +304,31 @@ impl Touch {
                         _ if shift.active() => SHIFT_ON,
                         _ => SHIFT,
                     };
-                    pen.button(layout.button(Button::Shift), shift.active(), icon, Turn::Up);
+                    pen.part_button(
+                        Part::Shift,
+                        layout.button(Button::Shift),
+                        shift.active(),
+                        icon,
+                        Turn::Up,
+                    );
                 }
                 self.draw_menu(&mut pen, now);
             }
             Mode::Playing if self.panel => self.draw_panel(&mut pen),
             Mode::Playing => {
+                pen.part(Part::DPad);
                 match self.context.movement {
                     Movement::DPad => self.draw_dpad(&mut pen, sneaking),
                     Movement::Joystick => self.draw_joystick(&mut pen),
                 }
+                pen.plain();
                 let held = |button| {
                     self.fingers
                         .iter()
                         .any(|f| matches!(f.role, Role::Button(b) if b == button))
                 };
-                pen.button(
+                pen.part_button(
+                    Part::Jump,
                     layout.button(Button::Jump),
                     held(Button::Jump),
                     JUMP,
@@ -281,13 +336,15 @@ impl Touch {
                 );
                 let inventory = layout.button(Button::Inventory);
                 pen.button(inventory, held(Button::Inventory), DOTS, Turn::Up);
-                pen.button(
+                pen.part_button(
+                    Part::Pause,
                     layout.button(Button::Pause),
                     held(Button::Pause),
                     PAUSE,
                     Turn::Up,
                 );
-                pen.button(
+                pen.part_button(
+                    Part::Chat,
                     layout.button(Button::Chat),
                     held(Button::Chat),
                     CHAT,
@@ -332,7 +389,7 @@ impl Touch {
             _ => None,
         });
         let centre = origin.unwrap_or_else(|| layout.stick_home());
-        let radius = layout.reach() / layout.unit;
+        let radius = layout.reach() / pen.unit;
         pen.disc(centre, radius, OUTLINE);
         pen.disc(centre, radius - 1.0, PLATE);
         let knob = [
@@ -414,13 +471,18 @@ impl Touch {
 
     /// Play's key caps, with their keys on them.
     fn draw_caps(&self, pen: &mut Pen<'_>) {
+        if pen.layout.hidden(Part::Caps) {
+            return;
+        }
         let g = pen.layout.gui;
+        pen.part(Part::Caps);
         for control in self.live_controls() {
             let r = pen.layout.control(control.place);
             pen.plate(r, self.on_control(control));
             let top = r[1] + (r[3] - CAPITALS * g) / 2.0;
             pen.text(control.keys, r, top, u32::MAX);
         }
+        pen.plain();
     }
 
     /// The Fn panel over play, which it shades: Back, and a tile for each key with what it does.
@@ -428,7 +490,13 @@ impl Touch {
         let layout = pen.layout;
         let g = layout.gui;
         pen.fill(layout.screen(), SHADE);
-        pen.button(layout.button(Button::Back), false, ARROW, Turn::Left);
+        pen.part_button(
+            Part::Back,
+            layout.button(Button::Back),
+            false,
+            ARROW,
+            Turn::Left,
+        );
         pen.plate(layout.panel(), false);
         for control in self.live_controls() {
             let r = layout.control(control.place);
@@ -437,5 +505,21 @@ impl Touch {
             pen.text(control.keys, r, top, rgba(255, 255, 85, 255));
             pen.text(control.does, r, top + LINE * g, u32::MAX);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opacity_scales_the_alpha_and_keeps_the_color() {
+        assert_eq!(fade(OUTLINE, 1.0), OUTLINE);
+        assert_eq!(fade(0xdcff_ffff, 0.5), 0x6eff_ffff);
+        assert_eq!(fade(0xdcab_cdef, 0.0), 0x00ab_cdef);
+        assert_eq!(fade(u32::MAX, 0.25) >> 24, 64);
+        // Never brighter than it was, and never negative.
+        assert_eq!(fade(PLATE, 2.0), PLATE);
+        assert_eq!(fade(PLATE, -1.0), PLATE & 0x00ff_ffff);
     }
 }
