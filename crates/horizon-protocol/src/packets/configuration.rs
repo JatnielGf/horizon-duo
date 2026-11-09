@@ -7,6 +7,7 @@ use crate::{
         VarInt, Writer,
     },
     packet, packet_enum,
+    dialog::{CustomClickAction, ShowDialog},
     packets::Empty,
 };
 use horizon_world::nbt::Tag;
@@ -63,6 +64,7 @@ packet_enum!(Clientbound, crate::ids::configuration::clientbound {
     UpdateTags(UpdateTags) = UPDATE_TAGS,
     SelectKnownPacks(SelectKnownPacks) = SELECT_KNOWN_PACKS,
     ClearDialog(Empty) = CLEAR_DIALOG,
+    ShowDialog(ShowDialog) = SHOW_DIALOG,
     CodeOfConduct(CodeOfConduct) = CODE_OF_CONDUCT,
 });
 
@@ -135,6 +137,7 @@ packet!(
 packet_enum!(Serverbound, crate::ids::configuration::serverbound {
     ClientInformation(ClientInformation) = CLIENT_INFORMATION,
     CookieResponse(CookieResponse) = COOKIE_RESPONSE,
+    CustomClickAction(CustomClickAction) = CUSTOM_CLICK_ACTION,
     CustomPayload(CustomPayload) = CUSTOM_PAYLOAD,
     FinishConfiguration(Empty) = FINISH_CONFIGURATION,
     KeepAlive(KeepAlive) = KEEP_ALIVE,
