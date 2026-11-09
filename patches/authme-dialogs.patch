@@ -1,0 +1,2502 @@
+From 18de1bb932f97e265db083bc0da236525b0fe681 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Mon, 9 Nov 2026 11:23:18 +0000
+Subject: [PATCH 1/2] Read and answer server dialogs in the protocol
+
+ClientboundShowDialogPacket (configuration and play), ClientboundClearDialog in
+play, and ServerboundCustomClickAction (configuration and play). A dialog is
+given inline as NBT or by its id in the registry the server sent (`Holder`).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-protocol/src/dialog.rs         | 130 ++++++++++++++++++
+ crates/horizon-protocol/src/lib.rs            |   1 +
+ .../src/packets/configuration.rs              |   3 +
+ crates/horizon-protocol/src/packets/play.rs   |   4 +
+ 4 files changed, 138 insertions(+)
+ create mode 100644 crates/horizon-protocol/src/dialog.rs
+
+diff --git a/crates/horizon-protocol/src/dialog.rs b/crates/horizon-protocol/src/dialog.rs
+new file mode 100644
+index 0000000..ea2409d
+--- /dev/null
++++ b/crates/horizon-protocol/src/dialog.rs
+@@ -0,0 +1,130 @@
++//! The dialog packets: a server shows a dialog (a screen made of text, inputs and buttons) and the
++//! client answers with the action of the button that was pressed. AuthMe 6 logs players in with
++//! one, before they join and after.
++//!
++//! The shape of a dialog is in `Tag` form here; the client reads it (`horizon_client::dialog`).
++use crate::{
++    Result,
++    buf::{Codec, Ident, Nbt, Opt, Reader, Writer},
++    packet,
++};
++use horizon_world::nbt::Tag;
++
++/// `Holder<Dialog>`: either the dialog's id in the registry the server sent (read as `id + 1`),
++/// or `0` and the dialog itself as NBT.
++#[derive(Clone, Debug, PartialEq)]
++pub enum DialogRef {
++    Registry(i32),
++    Inline(Tag),
++}
++
++pub struct HolderDialog;
++
++impl Codec<DialogRef> for HolderDialog {
++    fn read(r: &mut Reader) -> Result<DialogRef> {
++        match r.varint()? {
++            0 => Ok(DialogRef::Inline(r.nbt()?)),
++            id => Ok(DialogRef::Registry(id - 1)),
++        }
++    }
++    fn write(v: &DialogRef, w: &mut Writer) {
++        match v {
++            DialogRef::Registry(id) => w.varint(id + 1),
++            DialogRef::Inline(tag) => {
++                w.varint(0);
++                w.nbt(tag);
++            }
++        }
++    }
++}
++
++packet!(
++    /// ClientboundShowDialogPacket (configuration and play).
++    ShowDialog { dialog: DialogRef => HolderDialog }
++);
++packet!(
++    /// ServerboundCustomClickActionPacket (configuration and play): the id of a button's custom
++    /// action, with the values of the dialog's inputs (or the action's own payload).
++    CustomClickAction { id: String => Ident, payload: Option<Tag> => Opt<Nbt> }
++);
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::packets::{Empty, configuration as cfg, play};
++
++    fn text(s: &str) -> Tag {
++        Tag::String(s.into())
++    }
++
++    fn sample() -> Tag {
++        Tag::compound([("type", text("minecraft:notice")), ("title", text("Login"))])
++    }
++
++    #[test]
++    fn a_dialog_is_inline_or_a_registry_entry() {
++        for dialog in [DialogRef::Inline(sample()), DialogRef::Registry(7)] {
++            let mut w = Writer::new();
++            HolderDialog::write(&dialog, &mut w);
++            let mut r = Reader::new(&w.data);
++            assert_eq!(HolderDialog::read(&mut r).unwrap(), dialog);
++            assert_eq!(r.remaining(), 0);
++        }
++        // Registry ids are sent plus one: 0 is "inline".
++        let mut w = Writer::new();
++        HolderDialog::write(&DialogRef::Registry(0), &mut w);
++        assert_eq!(w.data, [1]);
++    }
++
++    #[test]
++    fn show_dialog_is_read_in_configuration_and_in_play() {
++        let packet = ShowDialog {
++            dialog: DialogRef::Inline(sample()),
++        };
++        let mut w = Writer::new();
++        ShowDialog::write(&packet, &mut w);
++        let cfg_packet =
++            cfg::Clientbound::decode(crate::ids::configuration::clientbound::SHOW_DIALOG, &w.data)
++                .unwrap();
++        assert_eq!(cfg_packet, cfg::Clientbound::ShowDialog(packet.clone()));
++        let play_packet =
++            play::Clientbound::decode(crate::ids::play::clientbound::SHOW_DIALOG, &w.data).unwrap();
++        assert_eq!(play_packet, play::Clientbound::ShowDialog(packet));
++    }
++
++    #[test]
++    fn clear_dialog_is_read_in_play_too() {
++        let packet =
++            play::Clientbound::decode(crate::ids::play::clientbound::CLEAR_DIALOG, &[]).unwrap();
++        assert_eq!(packet, play::Clientbound::ClearDialog(Empty));
++    }
++
++    #[test]
++    fn the_answer_to_a_button_goes_out_in_both_states_with_its_own_id() {
++        let click = CustomClickAction {
++            id: "authme:login".into(),
++            payload: Some(Tag::compound([("password", text("hunter2"))])),
++        };
++        let configuration = cfg::Serverbound::CustomClickAction(click.clone()).encode();
++        assert_eq!(
++            configuration[0],
++            crate::ids::configuration::serverbound::CUSTOM_CLICK_ACTION as u8
++        );
++        let playing = play::Serverbound::CustomClickAction(click.clone()).encode();
++        assert_eq!(
++            playing[0],
++            crate::ids::play::serverbound::CUSTOM_CLICK_ACTION as u8
++        );
++        // The body is the same, and an answer without values is a single "absent" byte.
++        assert_eq!(configuration[1..], playing[1..]);
++        let none = CustomClickAction {
++            id: "a:b".into(),
++            payload: None,
++        };
++        let mut w = Writer::new();
++        CustomClickAction::write(&none, &mut w);
++        assert_eq!(*w.data.last().unwrap(), 0);
++        let mut r = Reader::new(&w.data);
++        assert_eq!(CustomClickAction::read(&mut r).unwrap(), none);
++    }
++}
+diff --git a/crates/horizon-protocol/src/lib.rs b/crates/horizon-protocol/src/lib.rs
+index f0bea2c..6eb5af9 100644
+--- a/crates/horizon-protocol/src/lib.rs
++++ b/crates/horizon-protocol/src/lib.rs
+@@ -6,6 +6,7 @@ pub mod buf;
+ pub mod chunk;
+ pub mod connection;
+ pub mod crypto;
++pub mod dialog;
+ pub mod entity_data;
+ pub mod frame;
+ pub mod ids;
+diff --git a/crates/horizon-protocol/src/packets/configuration.rs b/crates/horizon-protocol/src/packets/configuration.rs
+index a767110..77546ae 100644
+--- a/crates/horizon-protocol/src/packets/configuration.rs
++++ b/crates/horizon-protocol/src/packets/configuration.rs
+@@ -7,6 +7,7 @@ use crate::{
+         VarInt, Writer,
+     },
+     packet, packet_enum,
++    dialog::{CustomClickAction, ShowDialog},
+     packets::Empty,
+ };
+ use horizon_world::nbt::Tag;
+@@ -63,6 +64,7 @@ packet_enum!(Clientbound, crate::ids::configuration::clientbound {
+     UpdateTags(UpdateTags) = UPDATE_TAGS,
+     SelectKnownPacks(SelectKnownPacks) = SELECT_KNOWN_PACKS,
+     ClearDialog(Empty) = CLEAR_DIALOG,
++    ShowDialog(ShowDialog) = SHOW_DIALOG,
+     CodeOfConduct(CodeOfConduct) = CODE_OF_CONDUCT,
+ });
+ 
+@@ -135,6 +137,7 @@ packet!(
+ packet_enum!(Serverbound, crate::ids::configuration::serverbound {
+     ClientInformation(ClientInformation) = CLIENT_INFORMATION,
+     CookieResponse(CookieResponse) = COOKIE_RESPONSE,
++    CustomClickAction(CustomClickAction) = CUSTOM_CLICK_ACTION,
+     CustomPayload(CustomPayload) = CUSTOM_PAYLOAD,
+     FinishConfiguration(Empty) = FINISH_CONFIGURATION,
+     KeepAlive(KeepAlive) = KEEP_ALIVE,
+diff --git a/crates/horizon-protocol/src/packets/play.rs b/crates/horizon-protocol/src/packets/play.rs
+index 5195682..ca81d89 100644
+--- a/crates/horizon-protocol/src/packets/play.rs
++++ b/crates/horizon-protocol/src/packets/play.rs
+@@ -7,6 +7,7 @@ use crate::{
+         Vec3d, Writer,
+     },
+     chunk::{ChunkData, LightData},
++    dialog::{CustomClickAction, ShowDialog},
+     entity_data::{EntityData, Particle, Value},
+     item::{Hashed, HashedSlot, Slot, Stack},
+     packet, packet_enum,
+@@ -1629,7 +1630,9 @@ packet_enum!(Clientbound, crate::ids::play::clientbound {
+     ChangeDifficulty(ChangeDifficulty) = CHANGE_DIFFICULTY,
+     ChunkBatchFinished(ChunkBatchFinished) = CHUNK_BATCH_FINISHED,
+     ChunkBatchStart(Empty) = CHUNK_BATCH_START,
++    ClearDialog(Empty) = CLEAR_DIALOG,
+     ClearTitles(Bool1) = CLEAR_TITLES,
++    ShowDialog(ShowDialog) = SHOW_DIALOG,
+     Commands(Commands) = COMMANDS,
+     RecipeBookAdd(super::recipes::RecipeBookAdd) = RECIPE_BOOK_ADD,
+     RecipeBookRemove(super::recipes::RecipeBookRemove) = RECIPE_BOOK_REMOVE,
+@@ -2103,6 +2106,7 @@ packet_enum!(Serverbound, crate::ids::play::serverbound {
+     ContainerButtonClick(ContainerButtonClick) = CONTAINER_BUTTON_CLICK,
+     ContainerClick(ContainerClick) = CONTAINER_CLICK,
+     ContainerClose(ContainerClose) = CONTAINER_CLOSE,
++    CustomClickAction(CustomClickAction) = CUSTOM_CLICK_ACTION,
+     CustomPayload(CustomPayload) = CUSTOM_PAYLOAD,
+     EditBook(EditBook) = EDIT_BOOK,
+     Interact(Interact) = INTERACT,
+-- 
+2.43.0
+
+
+From f19768d1d49d733b4d522c114f6380b447b89413 Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Mon, 9 Nov 2026 11:23:21 +0000
+Subject: [PATCH 2/2] Show server dialogs (AuthMe 6's login) and answer them
+
+AuthMe 6 logs players in with a native dialog, before they join and after. The
+client ignored show_dialog, so the server waited for an answer that never came
+while the client sat on the connecting screen.
+
+dialog.rs reads a dialog (notice, confirmation, multi_action, server_links,
+dialog_list; text, boolean, single_option and number_range inputs; custom,
+run_command and nested-dialog actions), keeps what the player typed and builds
+the answer. dialog_ui.rs places its parts on any screen size and finds what a
+click hits. game/dialogs.rs shows it over everything, in the connecting phase or
+in a world, takes the mouse, touch and keyboard (the system keyboard comes up
+for a text input), and sends the answer as the configuration or play packet the
+connection is in. Escape closes a dialog only when it says it can be closed.
+
+Colors in a dialog's text are not shown yet.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-client/src/dialog.rs       | 886 ++++++++++++++++++++++
+ crates/horizon-client/src/dialog_ui.rs    | 390 ++++++++++
+ crates/horizon-client/src/game.rs         |  38 +-
+ crates/horizon-client/src/game/dialogs.rs | 462 +++++++++++
+ crates/horizon-client/src/game/remote.rs  |   9 +-
+ crates/horizon-client/src/game/touch.rs   |   2 +-
+ crates/horizon-client/src/game/typing.rs  |  27 +-
+ crates/horizon-client/src/lib.rs          |   2 +
+ crates/horizon-client/src/net.rs          | 186 +++++
+ 9 files changed, 1996 insertions(+), 6 deletions(-)
+ create mode 100644 crates/horizon-client/src/dialog.rs
+ create mode 100644 crates/horizon-client/src/dialog_ui.rs
+ create mode 100644 crates/horizon-client/src/game/dialogs.rs
+
+diff --git a/crates/horizon-client/src/dialog.rs b/crates/horizon-client/src/dialog.rs
+new file mode 100644
+index 0000000..bbd2147
+--- /dev/null
++++ b/crates/horizon-client/src/dialog.rs
+@@ -0,0 +1,886 @@
++//! Server dialogs: a screen a server shows (title, text, inputs and buttons) and whose answer it
++//! waits for. AuthMe 6 logs players in with one, before they join and after. This reads one from
++//! the NBT the server sent, keeps what the player typed, and says what a button press asks for;
++//! it draws nothing and sends nothing.
++//!
++//! The dialog types vanilla has are all read (`notice`, `confirmation`, `multi_action`,
++//! `server_links`, `dialog_list`); what a dialog says is flattened to plain text, so its colors
++//! are not shown yet. An action the client can't carry out is read and then does nothing.
++use horizon_protocol::text::{Language, plain};
++use horizon_world::nbt::{JavaString, Tag};
++
++/// How wide a button is when the dialog doesn't say, in GUI pixels.
++const BUTTON_WIDTH: f32 = 150.0;
++/// How long a text input may be when the dialog doesn't say.
++const TEXT_LENGTH: usize = 32;
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum Kind {
++    Notice,
++    Confirmation,
++    MultiAction,
++    ServerLinks,
++    DialogList,
++    /// A type this client doesn't know: shown with its text and an OK button.
++    Other(String),
++}
++
++/// What happens to the dialog once a button is pressed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum After {
++    Close,
++    /// It stays, as it was.
++    Nothing,
++    /// It stays, and waits for the server to answer.
++    Wait,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum Action {
++    /// Does nothing (an OK button).
++    None,
++    /// ServerboundCustomClickAction: `id`, with the inputs' values when `dynamic`, else `payload`.
++    Custom {
++        id: String,
++        dynamic: bool,
++        payload: Option<Tag>,
++    },
++    /// Another dialog, inline.
++    Show(Tag),
++    RunCommand(String),
++    SuggestCommand(String),
++    OpenUrl(String),
++    CopyToClipboard(String),
++    /// An action this client doesn't carry out (a page of a dialog list, a macro).
++    Unsupported(String),
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct Button {
++    pub label: String,
++    pub tooltip: Option<String>,
++    pub width: f32,
++    pub action: Action,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum Control {
++    Text {
++        initial: String,
++        max_length: usize,
++        /// Whether it takes more than one line.
++        multiline: bool,
++    },
++    Boolean {
++        initial: bool,
++        on_true: String,
++        on_false: String,
++    },
++    /// The options' ids and shown names, and the one that starts selected.
++    Choice {
++        options: Vec<(String, String)>,
++        initial: usize,
++    },
++    Range {
++        start: f32,
++        end: f32,
++        initial: f32,
++        /// The step; none means any value.
++        step: Option<f32>,
++    },
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct Input {
++    /// The name its value goes under in the answer.
++    pub key: String,
++    pub label: String,
++    pub label_visible: bool,
++    pub width: f32,
++    pub control: Control,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct Dialog {
++    pub kind: Kind,
++    pub title: String,
++    pub body: Vec<String>,
++    pub inputs: Vec<Input>,
++    pub buttons: Vec<Button>,
++    /// The button that leaves a dialog (multi-action, server links, dialog list).
++    pub exit: Option<Button>,
++    pub escape_closes: bool,
++    pub after: After,
++    pub columns: usize,
++}
++
++fn get<'t>(tag: &'t Tag, key: &str) -> Option<&'t Tag> {
++    match tag {
++        Tag::Compound(map) => map.get(&JavaString::from(key)),
++        _ => None,
++    }
++}
++
++fn string(tag: &Tag, key: &str) -> Option<String> {
++    match get(tag, key)? {
++        Tag::String(s) => Some(s.to_string_lossy()),
++        _ => None,
++    }
++}
++
++fn integer(tag: &Tag) -> Option<i64> {
++    match tag {
++        Tag::Byte(v) => Some(i64::from(*v)),
++        Tag::Short(v) => Some(i64::from(*v)),
++        Tag::Int(v) => Some(i64::from(*v)),
++        Tag::Long(v) => Some(*v),
++        _ => None,
++    }
++}
++
++fn number(tag: &Tag) -> Option<f32> {
++    match tag {
++        Tag::Float(bits) => Some(f32::from_bits(*bits)),
++        Tag::Double(bits) => Some(f64::from_bits(*bits) as f32),
++        other => integer(other).map(|v| v as f32),
++    }
++}
++
++fn boolean(tag: &Tag, key: &str, default: bool) -> bool {
++    get(tag, key).and_then(integer).map_or(default, |v| v != 0)
++}
++
++/// The elements of a list, or the one element a single value stands for.
++fn many(tag: &Tag) -> Vec<&Tag> {
++    match tag {
++        Tag::List(items) => items.iter().collect(),
++        other => vec![other],
++    }
++}
++
++/// `minecraft:notice` and `notice` are the same type.
++fn kind_of(tag: &Tag) -> String {
++    let name = string(tag, "type").unwrap_or_default();
++    name.strip_prefix("minecraft:").unwrap_or(&name).to_owned()
++}
++
++fn text(tag: &Tag, key: &str, lang: &Language) -> Option<String> {
++    get(tag, key).map(|component| plain(component, lang))
++}
++
++fn read_action(tag: &Tag) -> Action {
++    let kind = kind_of(tag);
++    let own = |key: &str| string(tag, key).unwrap_or_default();
++    match kind.as_str() {
++        "custom" => Action::Custom {
++            id: own("id"),
++            dynamic: false,
++            payload: get(tag, "payload").cloned(),
++        },
++        "dynamic/custom" => Action::Custom {
++            id: own("id"),
++            dynamic: true,
++            payload: get(tag, "additions").cloned(),
++        },
++        "show_dialog" => match get(tag, "dialog") {
++            Some(dialog @ Tag::Compound(_)) => Action::Show(dialog.clone()),
++            _ => Action::Unsupported(kind),
++        },
++        "run_command" => Action::RunCommand(own("command")),
++        "suggest_command" => Action::SuggestCommand(own("command")),
++        "open_url" => Action::OpenUrl(own("url")),
++        "copy_to_clipboard" => Action::CopyToClipboard(own("value")),
++        _ => Action::Unsupported(kind),
++    }
++}
++
++fn read_button(tag: &Tag, lang: &Language) -> Button {
++    Button {
++        label: text(tag, "label", lang).unwrap_or_default(),
++        tooltip: text(tag, "tooltip", lang),
++        width: get(tag, "width")
++            .and_then(number)
++            .filter(|w| *w >= 1.0)
++            .unwrap_or(BUTTON_WIDTH),
++        action: get(tag, "action").map_or(Action::None, read_action),
++    }
++}
++
++fn read_input(tag: &Tag, lang: &Language) -> Option<Input> {
++    let key = string(tag, "key")?;
++    let label = text(tag, "label", lang).unwrap_or_default();
++    let control = match kind_of(tag).as_str() {
++        "text" => Control::Text {
++            initial: string(tag, "initial").unwrap_or_default(),
++            max_length: get(tag, "max_length")
++                .and_then(integer)
++                .map_or(TEXT_LENGTH, |n| n.clamp(1, 32767) as usize),
++            multiline: get(tag, "multiline").is_some(),
++        },
++        "boolean" => Control::Boolean {
++            initial: boolean(tag, "initial", false),
++            on_true: string(tag, "on_true").unwrap_or_else(|| "true".into()),
++            on_false: string(tag, "on_false").unwrap_or_else(|| "false".into()),
++        },
++        "single_option" => {
++            let options: Vec<(String, String)> = get(tag, "options")
++                .map(many)
++                .unwrap_or_default()
++                .into_iter()
++                .filter_map(|option| match option {
++                    // An option is its id alone, or an id with a name to show.
++                    Tag::String(id) => Some((id.to_string_lossy(), id.to_string_lossy())),
++                    Tag::Compound(_) => {
++                        let id = string(option, "id")?;
++                        let shown = text(option, "display", lang).unwrap_or_else(|| id.clone());
++                        Some((id, shown))
++                    }
++                    _ => None,
++                })
++                .collect();
++            let initial = get(tag, "options")
++                .map(many)
++                .unwrap_or_default()
++                .into_iter()
++                .filter(|o| matches!(o, Tag::String(_) | Tag::Compound(_)))
++                .position(|o| boolean(o, "initial", false))
++                .unwrap_or(0);
++            if options.is_empty() {
++                return None;
++            }
++            Control::Choice { options, initial }
++        }
++        "number_range" => {
++            let start = get(tag, "start").and_then(number).unwrap_or(0.0);
++            let end = get(tag, "end").and_then(number).unwrap_or(start);
++            let (low, high) = (start.min(end), start.max(end));
++            Control::Range {
++                start: low,
++                end: high,
++                initial: get(tag, "initial")
++                    .and_then(number)
++                    .unwrap_or(low)
++                    .clamp(low, high),
++                step: get(tag, "step").and_then(number).filter(|s| *s > 0.0),
++            }
++        }
++        _ => return None,
++    };
++    Some(Input {
++        key,
++        label,
++        label_visible: boolean(tag, "label_visible", true),
++        width: get(tag, "width")
++            .and_then(number)
++            .filter(|w| *w >= 1.0)
++            .unwrap_or(200.0),
++        control,
++    })
++}
++
++/// A dialog's body: a message, or an item with a description (only the description is shown).
++fn read_body(tag: &Tag, lang: &Language) -> Vec<String> {
++    let Some(body) = get(tag, "body") else {
++        return Vec::new();
++    };
++    many(body)
++        .into_iter()
++        .filter_map(|part| match kind_of(part).as_str() {
++            "plain_message" => text(part, "contents", lang),
++            "item" => get(part, "description").and_then(|d| text(d, "contents", lang)),
++            _ => None,
++        })
++        .collect()
++}
++
++impl Dialog {
++    /// The dialog in `tag`, with its texts in `lang`.
++    pub fn read(tag: &Tag, lang: &Language) -> Dialog {
++        let kind = match kind_of(tag).as_str() {
++            "notice" => Kind::Notice,
++            "confirmation" => Kind::Confirmation,
++            "multi_action" => Kind::MultiAction,
++            "server_links" => Kind::ServerLinks,
++            "dialog_list" => Kind::DialogList,
++            other => Kind::Other(other.to_owned()),
++        };
++        let ok = || Button {
++            label: lang.get("gui.ok").cloned().unwrap_or_else(|| "OK".into()),
++            tooltip: None,
++            width: BUTTON_WIDTH,
++            action: Action::None,
++        };
++        let button = |key: &str| get(tag, key).map(|b| read_button(b, lang));
++        let mut exit = button("exit_action");
++        let buttons = match &kind {
++            Kind::Notice => vec![button("action").unwrap_or_else(ok)],
++            Kind::Confirmation => button("yes").into_iter().chain(button("no")).collect(),
++            Kind::MultiAction => get(tag, "actions")
++                .map(many)
++                .unwrap_or_default()
++                .into_iter()
++                .map(|b| read_button(b, lang))
++                .collect(),
++            Kind::DialogList => get(tag, "dialogs")
++                .map(many)
++                .unwrap_or_default()
++                .into_iter()
++                .filter(|d| matches!(d, Tag::Compound(_)))
++                .map(|d| Button {
++                    label: text(d, "title", lang).unwrap_or_default(),
++                    tooltip: None,
++                    width: get(tag, "button_width")
++                        .and_then(number)
++                        .filter(|w| *w >= 1.0)
++                        .unwrap_or(BUTTON_WIDTH),
++                    action: Action::Show(d.clone()),
++                })
++                .collect(),
++            Kind::ServerLinks => Vec::new(),
++            Kind::Other(_) => vec![ok()],
++        };
++        // A dialog nobody can leave would trap the player: it always has a way out.
++        if buttons.is_empty() && exit.is_none() {
++            exit = Some(ok());
++        }
++        Dialog {
++            kind,
++            title: text(tag, "title", lang).unwrap_or_default(),
++            body: read_body(tag, lang),
++            inputs: get(tag, "inputs")
++                .map(many)
++                .unwrap_or_default()
++                .into_iter()
++                .filter_map(|input| read_input(input, lang))
++                .collect(),
++            buttons,
++            exit,
++            escape_closes: boolean(tag, "can_close_with_escape", true),
++            after: match string(tag, "after_action").as_deref() {
++                Some("none") => After::Nothing,
++                Some("wait_for_response") => After::Wait,
++                _ => After::Close,
++            },
++            columns: get(tag, "columns")
++                .and_then(integer)
++                .map_or(2, |n| n.clamp(1, 8) as usize),
++        }
++    }
++
++    /// Every button, the way out last.
++    pub fn all_buttons(&self) -> impl Iterator<Item = &Button> {
++        self.buttons.iter().chain(self.exit.iter())
++    }
++}
++
++/// What a control holds right now.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Value {
++    Text(String),
++    Bool(bool),
++    Choice(usize),
++    Range(f32),
++}
++
++/// What the player has typed or picked in a dialog.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Form {
++    values: Vec<Value>,
++}
++
++/// What a pressed button asks for.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Outcome {
++    Nothing,
++    /// Send ServerboundCustomClickAction.
++    Send {
++        id: String,
++        payload: Option<Tag>,
++    },
++    /// Show this dialog (inline) instead.
++    Show(Tag),
++    RunCommand(String),
++    SuggestCommand(String),
++    OpenUrl(String),
++    CopyToClipboard(String),
++}
++
++impl Form {
++    pub fn new(dialog: &Dialog) -> Self {
++        let values = dialog
++            .inputs
++            .iter()
++            .map(|input| match &input.control {
++                Control::Text {
++                    initial,
++                    max_length,
++                    ..
++                } => Value::Text(initial.chars().take(*max_length).collect()),
++                Control::Boolean { initial, .. } => Value::Bool(*initial),
++                Control::Choice { initial, .. } => Value::Choice(*initial),
++                Control::Range { initial, .. } => Value::Range(*initial),
++            })
++            .collect();
++        Self { values }
++    }
++
++    pub fn value(&self, input: usize) -> Option<&Value> {
++        self.values.get(input)
++    }
++
++    /// Types into text input `input`, up to its length (a line break only where it takes lines).
++    pub fn type_text(&mut self, dialog: &Dialog, input: usize, typed: &str) {
++        let (
++            Some(Value::Text(value)),
++            Some(Control::Text {
++                max_length,
++                multiline,
++                ..
++            }),
++        ) = (
++            self.values.get_mut(input),
++            dialog.inputs.get(input).map(|i| &i.control),
++        )
++        else {
++            return;
++        };
++        for c in typed.chars() {
++            let allowed = !c.is_control() || (*multiline && c == '\n');
++            if allowed && value.chars().count() < *max_length {
++                value.push(c);
++            }
++        }
++    }
++
++    pub fn backspace(&mut self, input: usize) {
++        if let Some(Value::Text(value)) = self.values.get_mut(input) {
++            value.pop();
++        }
++    }
++
++    /// A tap on a boolean flips it, and on a choice moves to the next option.
++    pub fn toggle(&mut self, dialog: &Dialog, input: usize) {
++        match (
++            self.values.get_mut(input),
++            dialog.inputs.get(input).map(|i| &i.control),
++        ) {
++            (Some(Value::Bool(value)), Some(Control::Boolean { .. })) => *value = !*value,
++            (Some(Value::Choice(at)), Some(Control::Choice { options, .. })) => {
++                *at = (*at + 1) % options.len();
++            }
++            _ => {}
++        }
++    }
++
++    /// Sets a number range from `share` of its track, from 0 to 1, on its steps.
++    pub fn set_range(&mut self, dialog: &Dialog, input: usize, share: f32) {
++        let (
++            Some(Value::Range(value)),
++            Some(Control::Range {
++                start, end, step, ..
++            }),
++        ) = (
++            self.values.get_mut(input),
++            dialog.inputs.get(input).map(|i| &i.control),
++        )
++        else {
++            return;
++        };
++        let mut at = start + (end - start) * share.clamp(0.0, 1.0);
++        if let Some(step) = step {
++            at = start + ((at - start) / step).round() * step;
++        }
++        *value = at.clamp(*start, *end);
++    }
++
++    /// What the dialog answers: each input's value under its key. A text and a choice are text,
++    /// a boolean is a byte and a range is a float.
++    pub fn answer(&self, dialog: &Dialog) -> Tag {
++        let entries = dialog
++            .inputs
++            .iter()
++            .zip(&self.values)
++            .map(|(input, value)| {
++                let tag = match (value, &input.control) {
++                    (Value::Text(text), _) => Tag::String(text.as_str().into()),
++                    (Value::Bool(on), _) => Tag::Byte(i8::from(*on)),
++                    (Value::Choice(at), Control::Choice { options, .. }) => {
++                        let id = options
++                            .get(*at)
++                            .map(|(id, _)| id.as_str())
++                            .unwrap_or_default();
++                        Tag::String(id.into())
++                    }
++                    (Value::Choice(_), _) => Tag::String("".into()),
++                    (Value::Range(v), _) => Tag::Float(v.to_bits()),
++                };
++                (input.key.as_str(), tag)
++            });
++        Tag::compound(entries)
++    }
++
++    /// What pressing `button` asks for.
++    pub fn press(&self, dialog: &Dialog, button: &Button) -> Outcome {
++        match &button.action {
++            Action::None | Action::Unsupported(_) => Outcome::Nothing,
++            Action::Custom {
++                id,
++                dynamic,
++                payload,
++            } => {
++                let payload = if *dynamic {
++                    let mut answer = self.answer(dialog);
++                    // The action's own additions go along with the inputs.
++                    if let (Tag::Compound(values), Some(Tag::Compound(extra))) =
++                        (&mut answer, payload)
++                    {
++                        for (key, value) in extra {
++                            values.entry(key.clone()).or_insert_with(|| value.clone());
++                        }
++                    }
++                    Some(answer)
++                } else {
++                    payload.clone()
++                };
++                Outcome::Send {
++                    id: id.clone(),
++                    payload,
++                }
++            }
++            Action::Show(tag) => Outcome::Show(tag.clone()),
++            Action::RunCommand(c) => Outcome::RunCommand(c.clone()),
++            Action::SuggestCommand(c) => Outcome::SuggestCommand(c.clone()),
++            Action::OpenUrl(u) => Outcome::OpenUrl(u.clone()),
++            Action::CopyToClipboard(v) => Outcome::CopyToClipboard(v.clone()),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn s(v: &str) -> Tag {
++        Tag::String(v.into())
++    }
++    fn c<const N: usize>(entries: [(&str, Tag); N]) -> Tag {
++        Tag::compound(entries)
++    }
++    fn lang() -> Language {
++        Language::new()
++    }
++
++    /// A login dialog the way AuthMe-style plugins send one: a text input and two buttons.
++    fn login() -> Tag {
++        c([
++            ("type", s("minecraft:multi_action")),
++            ("title", s("Login")),
++            ("can_close_with_escape", Tag::Byte(0)),
++            (
++                "body",
++                c([
++                    ("type", s("minecraft:plain_message")),
++                    ("contents", s("Welcome back, Jatniel!")),
++                ]),
++            ),
++            (
++                "inputs",
++                Tag::List(vec![c([
++                    ("type", s("minecraft:text")),
++                    ("key", s("password")),
++                    ("label", s("Password")),
++                    ("max_length", Tag::Int(16)),
++                ])]),
++            ),
++            (
++                "actions",
++                Tag::List(vec![c([
++                    ("label", s("Login")),
++                    ("width", Tag::Int(120)),
++                    (
++                        "action",
++                        c([
++                            ("type", s("minecraft:dynamic/custom")),
++                            ("id", s("authme:login")),
++                        ]),
++                    ),
++                ])]),
++            ),
++            (
++                "exit_action",
++                c([
++                    ("label", s("Leave")),
++                    (
++                        "action",
++                        c([("type", s("minecraft:custom")), ("id", s("authme:leave"))]),
++                    ),
++                ]),
++            ),
++        ])
++    }
++
++    #[test]
++    fn a_login_dialog_is_read() {
++        let d = Dialog::read(&login(), &lang());
++        assert_eq!(d.kind, Kind::MultiAction);
++        assert_eq!(d.title, "Login");
++        assert_eq!(d.body, ["Welcome back, Jatniel!"]);
++        assert!(!d.escape_closes, "Escape does not leave it");
++        assert_eq!(d.after, After::Close);
++        assert_eq!(d.inputs.len(), 1);
++        assert_eq!(d.inputs[0].key, "password");
++        assert_eq!(d.buttons.len(), 1);
++        assert_eq!(d.buttons[0].width, 120.0);
++        assert_eq!(d.exit.as_ref().unwrap().label, "Leave");
++        assert_eq!(d.all_buttons().count(), 2);
++    }
++
++    #[test]
++    fn the_buttons_answer_carries_what_was_typed() {
++        let d = Dialog::read(&login(), &lang());
++        let mut form = Form::new(&d);
++        form.type_text(&d, 0, "hunter2");
++        form.backspace(0);
++        form.type_text(&d, 0, "\n\u{7}!");
++        let outcome = form.press(&d, &d.buttons[0]);
++        assert_eq!(
++            outcome,
++            Outcome::Send {
++                id: "authme:login".into(),
++                payload: Some(c([("password", s("hunter!"))])),
++            }
++        );
++        // The way out sends its id, with the action's own (absent) payload.
++        assert_eq!(
++            form.press(&d, d.exit.as_ref().unwrap()),
++            Outcome::Send {
++                id: "authme:leave".into(),
++                payload: None
++            }
++        );
++    }
++
++    #[test]
++    fn a_text_input_stops_at_its_length() {
++        let d = Dialog::read(&login(), &lang());
++        let mut form = Form::new(&d);
++        form.type_text(&d, 0, &"x".repeat(40));
++        assert_eq!(form.value(0), Some(&Value::Text("x".repeat(16))));
++    }
++
++    #[test]
++    fn inputs_have_vanillas_kinds_and_defaults() {
++        let tag = c([
++            ("type", s("notice")),
++            ("title", s("Settings")),
++            (
++                "inputs",
++                Tag::List(vec![
++                    c([
++                        ("type", s("boolean")),
++                        ("key", s("remember")),
++                        ("label", s("Remember me")),
++                        ("initial", Tag::Byte(1)),
++                    ]),
++                    c([
++                        ("type", s("single_option")),
++                        ("key", s("lang")),
++                        ("label", s("Language")),
++                        (
++                            "options",
++                            Tag::List(vec![
++                                c([("id", s("en")), ("display", s("English"))]),
++                                c([
++                                    ("id", s("es")),
++                                    ("display", s("Español")),
++                                    ("initial", Tag::Byte(1)),
++                                ]),
++                            ]),
++                        ),
++                    ]),
++                    c([
++                        ("type", s("number_range")),
++                        ("key", s("volume")),
++                        ("label", s("Volume")),
++                        ("start", Tag::Float(0.0f32.to_bits())),
++                        ("end", Tag::Float(10.0f32.to_bits())),
++                        ("initial", Tag::Float(5.0f32.to_bits())),
++                        ("step", Tag::Float(2.0f32.to_bits())),
++                    ]),
++                    c([("type", s("unheard_of")), ("key", s("x"))]),
++                    c([("type", s("text")), ("label", s("no key"))]),
++                ]),
++            ),
++        ]);
++        let d = Dialog::read(&tag, &lang());
++        assert_eq!(
++            d.inputs.len(),
++            3,
++            "an unknown input and one without a key are dropped"
++        );
++        let mut form = Form::new(&d);
++        assert_eq!(form.value(0), Some(&Value::Bool(true)));
++        assert_eq!(form.value(1), Some(&Value::Choice(1)));
++        assert_eq!(form.value(2), Some(&Value::Range(5.0)));
++        form.toggle(&d, 0);
++        form.toggle(&d, 1);
++        form.set_range(&d, 2, 0.83);
++        assert_eq!(form.value(0), Some(&Value::Bool(false)));
++        assert_eq!(form.value(1), Some(&Value::Choice(0)));
++        assert_eq!(form.value(2), Some(&Value::Range(8.0)), "on its steps");
++        assert_eq!(
++            form.answer(&d),
++            c([
++                ("remember", Tag::Byte(0)),
++                ("lang", s("en")),
++                ("volume", Tag::Float(8.0f32.to_bits())),
++            ])
++        );
++        // A notice with no action has an OK button that does nothing.
++        assert_eq!(d.kind, Kind::Notice);
++        assert_eq!(d.buttons.len(), 1);
++        assert_eq!(d.buttons[0].label, "OK");
++        assert_eq!(form.press(&d, &d.buttons[0]), Outcome::Nothing);
++    }
++
++    #[test]
++    fn a_confirmation_has_its_two_buttons_and_a_dialog_can_open_another() {
++        let inner = c([("type", s("notice")), ("title", s("Rules"))]);
++        let tag = c([
++            ("type", s("confirmation")),
++            ("title", s("Join?")),
++            (
++                "yes",
++                c([
++                    ("label", s("Yes")),
++                    (
++                        "action",
++                        c([("type", s("show_dialog")), ("dialog", inner.clone())]),
++                    ),
++                ]),
++            ),
++            (
++                "no",
++                c([
++                    ("label", s("No")),
++                    (
++                        "action",
++                        c([("type", s("run_command")), ("command", s("leave"))]),
++                    ),
++                ]),
++            ),
++        ]);
++        let d = Dialog::read(&tag, &lang());
++        let form = Form::new(&d);
++        assert_eq!(d.buttons.len(), 2);
++        assert_eq!(form.press(&d, &d.buttons[0]), Outcome::Show(inner));
++        assert_eq!(
++            form.press(&d, &d.buttons[1]),
++            Outcome::RunCommand("leave".into())
++        );
++    }
++
++    #[test]
++    fn a_dynamic_action_adds_its_own_values_to_the_inputs() {
++        let tag = c([
++            ("type", s("notice")),
++            (
++                "inputs",
++                Tag::List(vec![c([
++                    ("type", s("text")),
++                    ("key", s("name")),
++                    ("initial", s("Ana")),
++                ])]),
++            ),
++            (
++                "action",
++                c([
++                    ("label", s("Send")),
++                    (
++                        "action",
++                        c([
++                            ("type", s("dynamic/custom")),
++                            ("id", s("a:b")),
++                            (
++                                "additions",
++                                c([("mode", s("login")), ("name", s("ignored"))]),
++                            ),
++                        ]),
++                    ),
++                ]),
++            ),
++        ]);
++        let d = Dialog::read(&tag, &lang());
++        let outcome = Form::new(&d).press(&d, &d.buttons[0]);
++        assert_eq!(
++            outcome,
++            Outcome::Send {
++                id: "a:b".into(),
++                payload: Some(c([("name", s("Ana")), ("mode", s("login"))])),
++            },
++            "what the player typed wins over an addition"
++        );
++    }
++
++    #[test]
++    fn a_dialog_always_has_a_way_out_and_unknown_things_do_not_break_it() {
++        // A server-links dialog without an exit action, and a type nobody knows.
++        for kind in ["server_links", "something_new"] {
++            let d = Dialog::read(&c([("type", s(kind)), ("title", s("T"))]), &lang());
++            assert!(d.all_buttons().count() >= 1, "{kind}");
++        }
++        // An empty or broken value is an empty dialog, not a failure.
++        let d = Dialog::read(&Tag::End, &lang());
++        assert!(matches!(d.kind, Kind::Other(_)));
++        assert!(d.all_buttons().count() >= 1);
++        // Unsupported actions do nothing when pressed.
++        let tag = c([
++            ("type", s("notice")),
++            (
++                "action",
++                c([
++                    ("label", s("x")),
++                    (
++                        "action",
++                        c([("type", s("change_page")), ("page", Tag::Int(2))]),
++                    ),
++                ]),
++            ),
++        ]);
++        let d = Dialog::read(&tag, &lang());
++        assert_eq!(Form::new(&d).press(&d, &d.buttons[0]), Outcome::Nothing);
++    }
++
++    #[test]
++    fn a_dialog_list_has_a_button_for_each_dialog() {
++        let tag = c([
++            ("type", s("dialog_list")),
++            (
++                "dialogs",
++                Tag::List(vec![
++                    c([("type", s("notice")), ("title", s("One"))]),
++                    c([("type", s("notice")), ("title", s("Two"))]),
++                ]),
++            ),
++            ("button_width", Tag::Int(90)),
++        ]);
++        let d = Dialog::read(&tag, &lang());
++        let labels: Vec<_> = d.buttons.iter().map(|b| b.label.as_str()).collect();
++        assert_eq!(labels, ["One", "Two"]);
++        assert!(d.buttons.iter().all(|b| b.width == 90.0));
++    }
++
++    #[test]
++    fn after_action_and_titles_in_the_players_language() {
++        let mut language = lang();
++        language.insert("dialog.login".into(), "Iniciar sesión".into());
++        let tag = c([
++            ("type", s("notice")),
++            ("title", c([("translate", s("dialog.login"))])),
++            ("after_action", s("wait_for_response")),
++        ]);
++        let d = Dialog::read(&tag, &language);
++        assert_eq!(d.title, "Iniciar sesión");
++        assert_eq!(d.after, After::Wait);
++    }
++}
+diff --git a/crates/horizon-client/src/dialog_ui.rs b/crates/horizon-client/src/dialog_ui.rs
+new file mode 100644
+index 0000000..0560e59
+--- /dev/null
++++ b/crates/horizon-client/src/dialog_ui.rs
+@@ -0,0 +1,390 @@
++//! Where the parts of a dialog sit on the screen, and what a click at a point hits. It works in
++//! GUI pixels and measures text through a function it is given, so it draws nothing and the
++//! game's font is not needed to test it.
++use crate::dialog::{Control, Dialog};
++
++pub type Rect = [f32; 4];
++
++/// The widest the dialog's content is, in GUI pixels.
++const CONTENT_WIDTH: f32 = 280.0;
++/// Space kept free at the screen's edges.
++const EDGE: f32 = 8.0;
++const LINE: f32 = 11.0;
++const ROW: f32 = 20.0;
++const GAP: f32 = 6.0;
++const BUTTON_GAP: f32 = 4.0;
++
++/// What a click can land on.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Hit {
++    /// Input `n`.
++    Input(usize),
++    /// Button `n`, counting the way out last (`Dialog::all_buttons`).
++    Button(usize),
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct PlacedInput {
++    /// The label above the control and where it goes (its y), when it is shown.
++    pub label: Option<(String, f32)>,
++    pub rect: Rect,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct Placed {
++    /// The title and its y; it is centered across the screen.
++    pub title: Option<(String, f32)>,
++    /// Each line of the body, wrapped, and its y.
++    pub lines: Vec<(String, f32)>,
++    pub inputs: Vec<PlacedInput>,
++    /// One for each of `Dialog::all_buttons`.
++    pub buttons: Vec<Rect>,
++    /// The body had to be cut short to leave room for the inputs and the buttons.
++    pub cut: bool,
++    pub center_x: f32,
++}
++
++/// `text` split into lines no wider than `limit`, at spaces (a word wider than it is cut).
++fn wrap(text: &str, limit: f32, width: &dyn Fn(&str) -> f32) -> Vec<String> {
++    let mut lines = Vec::new();
++    for paragraph in text.split('\n') {
++        let mut line = String::new();
++        for word in paragraph.split(' ') {
++            let candidate = if line.is_empty() {
++                word.to_owned()
++            } else {
++                format!("{line} {word}")
++            };
++            if width(&candidate) <= limit || line.is_empty() && word.is_empty() {
++                line = candidate;
++                continue;
++            }
++            if !line.is_empty() {
++                lines.push(std::mem::take(&mut line));
++            }
++            // A word alone may still be too wide.
++            let mut rest = word;
++            while width(rest) > limit && rest.chars().count() > 1 {
++                let mut cut = rest.chars().count() - 1;
++                while cut > 1 && width(&rest.chars().take(cut).collect::<String>()) > limit {
++                    cut -= 1;
++                }
++                let at = rest.char_indices().nth(cut).map_or(rest.len(), |(i, _)| i);
++                lines.push(rest[..at].to_owned());
++                rest = &rest[at..];
++            }
++            line = rest.to_owned();
++        }
++        lines.push(line);
++    }
++    lines
++}
++
++/// The rows of buttons: `columns` to a row, each as wide as it says (and no wider than its share
++/// of the content), the last row centered.
++fn button_rows(widths: &[f32], columns: usize, content: f32) -> Vec<Vec<f32>> {
++    let share = (content - BUTTON_GAP * (columns as f32 - 1.0)) / columns as f32;
++    widths
++        .chunks(columns.max(1))
++        .map(|row| row.iter().map(|w| w.min(share.max(40.0))).collect())
++        .collect()
++}
++
++pub fn place(dialog: &Dialog, size: (f32, f32), width: &dyn Fn(&str) -> f32) -> Placed {
++    let (screen_w, screen_h) = size;
++    let content = CONTENT_WIDTH.min(screen_w - 2.0 * EDGE).max(60.0);
++    let center_x = (screen_w / 2.0).floor();
++
++    // The fixed parts first: they must fit, the body gives way.
++    let mut fixed = 0.0;
++    let has_title = !dialog.title.is_empty();
++    if has_title {
++        fixed += LINE + GAP;
++    }
++    for input in &dialog.inputs {
++        let label = input.label_visible && !input.label.is_empty();
++        let shown_as_label = matches!(input.control, Control::Text { .. });
++        fixed += if label && shown_as_label { LINE } else { 0.0 } + ROW + GAP;
++    }
++    let buttons: Vec<f32> = dialog.all_buttons().map(|b| b.width).collect();
++    let in_grid = dialog.buttons.len();
++    let grid_columns = dialog.columns.clamp(1, 8).min(in_grid.max(1));
++    let grid = button_rows(&buttons[..in_grid], grid_columns, content);
++    let exit_row = usize::from(dialog.exit.is_some());
++    fixed += (grid.len() + exit_row) as f32 * (ROW + BUTTON_GAP);
++
++    let body: Vec<String> = dialog
++        .body
++        .iter()
++        .flat_map(|text| wrap(text, content, width))
++        .collect();
++    let room = (screen_h - 2.0 * EDGE - fixed - GAP).max(0.0);
++    let fits = (room / LINE).floor() as usize;
++    let cut = body.len() > fits;
++    let shown: Vec<String> = body.into_iter().take(fits).collect();
++    let body_height = if shown.is_empty() {
++        0.0
++    } else {
++        shown.len() as f32 * LINE + GAP
++    };
++
++    // The whole, centered across the screen's height.
++    let total = fixed + body_height;
++    let mut y = ((screen_h - total) / 2.0).floor().max(EDGE);
++
++    let title = has_title.then(|| {
++        let at = y;
++        y += LINE + GAP;
++        (dialog.title.clone(), at)
++    });
++    let lines = shown
++        .into_iter()
++        .map(|line| {
++            let at = y;
++            y += LINE;
++            (line, at)
++        })
++        .collect::<Vec<_>>();
++    if !lines.is_empty() {
++        y += GAP;
++    }
++
++    let mut inputs = Vec::new();
++    for input in &dialog.inputs {
++        let shown_as_label = matches!(input.control, Control::Text { .. });
++        let label = (input.label_visible && !input.label.is_empty() && shown_as_label).then(|| {
++            let at = y;
++            y += LINE;
++            (input.label.clone(), at)
++        });
++        let w = input.width.min(content);
++        inputs.push(PlacedInput {
++            label,
++            rect: [center_x - (w / 2.0).floor(), y, w, ROW],
++        });
++        y += ROW + GAP;
++    }
++
++    let mut placed_buttons = Vec::new();
++    for row in &grid {
++        let span: f32 = row.iter().sum::<f32>() + BUTTON_GAP * (row.len() as f32 - 1.0);
++        let mut x = center_x - (span / 2.0).floor();
++        for w in row {
++            placed_buttons.push([x, y, *w, ROW]);
++            x += w + BUTTON_GAP;
++        }
++        y += ROW + BUTTON_GAP;
++    }
++    if let Some(exit) = &dialog.exit {
++        let w = exit.width.min(content);
++        placed_buttons.push([center_x - (w / 2.0).floor(), y, w, ROW]);
++    }
++
++    Placed {
++        title,
++        lines,
++        inputs,
++        buttons: placed_buttons,
++        cut,
++        center_x,
++    }
++}
++
++fn inside(r: &Rect, x: f32, y: f32) -> bool {
++    x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]
++}
++
++impl Placed {
++    /// What a click at (`x`, `y`) lands on.
++    pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
++        self.buttons
++            .iter()
++            .position(|r| inside(r, x, y))
++            .map(Hit::Button)
++            .or_else(|| {
++                self.inputs
++                    .iter()
++                    .position(|i| inside(&i.rect, x, y))
++                    .map(Hit::Input)
++            })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use horizon_protocol::text::Language;
++    use horizon_world::nbt::Tag;
++
++    /// Six pixels a character, as the game's font is near enough.
++    fn six(text: &str) -> f32 {
++        text.chars().count() as f32 * 6.0
++    }
++
++    fn s(v: &str) -> Tag {
++        Tag::String(v.into())
++    }
++
++    fn login() -> Dialog {
++        let tag = Tag::compound([
++            ("type", s("multi_action")),
++            ("title", s("Login")),
++            (
++                "body",
++                Tag::compound([
++                    ("type", s("plain_message")),
++                    (
++                        "contents",
++                        s("Welcome back to the server, Jatniel. Please log in to play with us."),
++                    ),
++                ]),
++            ),
++            (
++                "inputs",
++                Tag::List(vec![Tag::compound([
++                    ("type", s("text")),
++                    ("key", s("password")),
++                    ("label", s("Password")),
++                ])]),
++            ),
++            (
++                "actions",
++                Tag::List(vec![Tag::compound([
++                    ("label", s("Login")),
++                    (
++                        "action",
++                        Tag::compound([("type", s("dynamic/custom")), ("id", s("a:b"))]),
++                    ),
++                ])]),
++            ),
++            ("exit_action", Tag::compound([("label", s("Leave"))])),
++        ]);
++        Dialog::read(&tag, &Language::new())
++    }
++
++    fn inside_screen(r: &Rect, size: (f32, f32)) -> bool {
++        r[0] >= 0.0 && r[1] >= 0.0 && r[0] + r[2] <= size.0 && r[1] + r[3] <= size.1
++    }
++
++    #[test]
++    fn words_wrap_at_spaces_and_long_words_are_cut() {
++        let lines = wrap("one two three four", 55.0, &six);
++        assert_eq!(lines, ["one two", "three", "four"]);
++        let lines = wrap("abcdefghijklmnop", 30.0, &six);
++        assert!(
++            lines.len() >= 3 && lines.iter().all(|l| six(l) <= 30.0),
++            "{lines:?}"
++        );
++        assert_eq!(wrap("a\nb", 60.0, &six), ["a", "b"]);
++        assert_eq!(wrap("", 60.0, &six), [""]);
++    }
++
++    #[test]
++    fn a_login_dialog_fits_every_screen_and_its_parts_do_not_overlap() {
++        for size in [
++            (480.0, 262.0),
++            (320.0, 180.0),
++            (427.0, 240.0),
++            (874.0, 402.0),
++        ] {
++            let d = login();
++            let placed = place(&d, size, &six);
++            assert_eq!(placed.buttons.len(), 2, "the Login button and the way out");
++            assert_eq!(placed.inputs.len(), 1);
++            let mut rects: Vec<Rect> = placed.buttons.clone();
++            rects.push(placed.inputs[0].rect);
++            for r in &rects {
++                assert!(inside_screen(r, size), "{size:?}: {r:?}");
++            }
++            for (i, a) in rects.iter().enumerate() {
++                for b in rects.iter().skip(i + 1) {
++                    let overlap = a[0] < b[0] + b[2]
++                        && b[0] < a[0] + a[2]
++                        && a[1] < b[1] + b[3]
++                        && b[1] < a[1] + a[3];
++                    assert!(!overlap, "{size:?}: {a:?} and {b:?}");
++                }
++            }
++            // The text sits above the controls.
++            let first = placed.inputs[0].rect[1];
++            let text_ys = placed
++                .lines
++                .iter()
++                .map(|(_, y)| *y)
++                .chain(placed.title.iter().map(|(_, y)| *y));
++            for y in text_ys {
++                assert!(y < first, "{size:?}");
++            }
++        }
++    }
++
++    #[test]
++    fn a_small_screen_cuts_the_body_and_keeps_the_controls() {
++        let mut d = login();
++        d.body = vec!["word ".repeat(200)];
++        let size = (320.0, 120.0);
++        let placed = place(&d, size, &six);
++        assert!(placed.cut, "the body gave way");
++        assert_eq!(placed.buttons.len(), 2);
++        for r in placed
++            .buttons
++            .iter()
++            .chain(placed.inputs.iter().map(|i| &i.rect))
++        {
++            assert!(inside_screen(r, size), "{r:?}");
++        }
++    }
++
++    #[test]
++    fn a_click_finds_the_button_or_input_under_it() {
++        let d = login();
++        let placed = place(&d, (480.0, 262.0), &six);
++        let login_button = placed.buttons[0];
++        let leave = placed.buttons[1];
++        let input = placed.inputs[0].rect;
++        let middle = |r: Rect| (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
++        let (x, y) = middle(login_button);
++        assert_eq!(placed.hit(x, y), Some(Hit::Button(0)));
++        let (x, y) = middle(leave);
++        assert_eq!(placed.hit(x, y), Some(Hit::Button(1)));
++        let (x, y) = middle(input);
++        assert_eq!(placed.hit(x, y), Some(Hit::Input(0)));
++        assert_eq!(placed.hit(1.0, 1.0), None);
++    }
++
++    #[test]
++    fn buttons_are_laid_out_in_the_columns_the_dialog_asks_for() {
++        let actions: Vec<Tag> = (0..5)
++            .map(|n| {
++                Tag::compound([
++                    ("label", s(&format!("Option {n}"))),
++                    ("width", Tag::Int(80)),
++                ])
++            })
++            .collect();
++        let tag = Tag::compound([
++            ("type", s("multi_action")),
++            ("title", s("Menu")),
++            ("columns", Tag::Int(2)),
++            ("actions", Tag::List(actions)),
++        ]);
++        let d = Dialog::read(&tag, &Language::new());
++        let placed = place(&d, (480.0, 262.0), &six);
++        assert_eq!(placed.buttons.len(), 5);
++        let rows: std::collections::BTreeSet<i32> =
++            placed.buttons.iter().map(|r| r[1] as i32).collect();
++        assert_eq!(rows.len(), 3, "two to a row: three rows");
++        // The first two share a row.
++        assert_eq!(placed.buttons[0][1], placed.buttons[1][1]);
++        assert!(placed.buttons[0][0] < placed.buttons[1][0]);
++    }
++
++    #[test]
++    fn a_dialog_with_nothing_but_a_title_still_has_its_way_out() {
++        let tag = Tag::compound([("type", s("notice")), ("title", s("Hi"))]);
++        let d = Dialog::read(&tag, &Language::new());
++        let placed = place(&d, (200.0, 100.0), &six);
++        assert_eq!(placed.buttons.len(), 1);
++        assert!(inside_screen(&placed.buttons[0], (200.0, 100.0)));
++    }
++}
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index f98caba..cb3a0e7 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -36,6 +36,7 @@ mod debug_keys;
+ mod decorated_pot;
+ mod dedicated;
+ mod deflect;
++mod dialogs;
+ mod dispense_fixture;
+ mod dispenser;
+ mod dragon;
+@@ -1208,6 +1209,8 @@ struct Covers {
+     /// A server's resource pack prompt (`PackConfirmScreen`): when it goes, the screen it covered
+     /// is the same one.
+     pack_prompt: bool,
++    /// A server's dialog.
++    dialog: bool,
+     book: bool,
+     sign: bool,
+ }
+@@ -1217,11 +1220,12 @@ fn inventory_takes_mouse(screen: Screen, covers: Covers) -> bool {
+     let Covers {
+         title,
+         pack_prompt,
++        dialog,
+         book,
+         sign,
+     } = covers;
+     matches!(screen, Screen::Inventory | Screen::Creative)
+-        && !(title.is_some() || pack_prompt || book || sign)
++        && !(title.is_some() || pack_prompt || dialog || book || sign)
+ }
+ 
+ /// A furnace screen's texture and title.
+@@ -5024,12 +5028,15 @@ impl Game<'_> {
+         self.preview_deal();
+         // The pack prompt replaces the connecting screen (setScreen), but
+         // in game it opens over the world.
+-        let mut batch = if self.server_packs.prompt.is_some() && self.player.is_none() {
++        let mut batch = if (self.server_packs.prompt.is_some() || self.dialog_open())
++            && self.player.is_none()
++        {
+             HudBatch::new(size)
+         } else {
+             self.hud_layers(size)
+         };
+         self.draw_pack_prompt(&mut batch);
++        self.draw_dialog(&mut batch);
+         // Gui.extractRenderState: the debug overlay comes after the screen
+         // and the toasts, so it is over everything, menus included.
+         self.draw_debug_overlay(&mut batch, size);
+@@ -5709,6 +5716,7 @@ impl Game<'_> {
+         Covers {
+             title: self.title.as_ref().map(title_page),
+             pack_prompt: self.server_packs.prompt.is_some(),
++            dialog: self.dialog_open(),
+             book: self.book.is_some(),
+             sign: self.sign_edit.is_some(),
+         }
+@@ -11367,6 +11375,11 @@ impl ApplicationHandler for Game<'_> {
+                     }
+                     self.screen_wheel(scaled(raw_x) as f32, d);
+                 }
++                WindowEvent::MouseInput { state, button, .. } if self.dialog_open() => {
++                    if state == ElementState::Pressed && button == MouseButton::Left {
++                        self.dialog_click();
++                    }
++                }
+                 WindowEvent::MouseInput { state, button, .. }
+                     if self.server_packs.prompt.is_some() =>
+                 {
+@@ -11568,6 +11581,27 @@ impl ApplicationHandler for Game<'_> {
+                         _ => {}
+                     }
+                 }
++                // A server's dialog takes the keys: Escape closes one that can be, Enter presses
++                // its first button, Tab moves between its text inputs.
++                WindowEvent::KeyboardInput { event, .. } if self.dialog_open() => {
++                    if event.state == ElementState::Pressed {
++                        match event.physical_key {
++                            PhysicalKey::Code(KeyCode::Escape) => self.dialog_escape(),
++                            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
++                                self.dialog_enter()
++                            }
++                            PhysicalKey::Code(KeyCode::Tab) => self.dialog_next_input(),
++                            PhysicalKey::Code(KeyCode::Backspace) => self.dialog_backspace(),
++                            PhysicalKey::Code(_) => {
++                                if let Some(text) = &event.text {
++                                    self.dialog_type(text);
++                                }
++                            }
++                            // The system keyboard's text arrives through the typing field.
++                            _ => {}
++                        }
++                    }
++                }
+                 // ConfirmScreen.keyPressed: Escape answers no.
+                 WindowEvent::KeyboardInput { event, .. } if self.server_packs.prompt.is_some() => {
+                     if event.state == ElementState::Pressed
+diff --git a/crates/horizon-client/src/game/dialogs.rs b/crates/horizon-client/src/game/dialogs.rs
+new file mode 100644
+index 0000000..94ebc70
+--- /dev/null
++++ b/crates/horizon-client/src/game/dialogs.rs
+@@ -0,0 +1,462 @@
++//! A server's dialog (`ClientboundShowDialogPacket`) bound to the game: the screen it shows over
++//! everything, in the connecting phase or in a world, and the answer it sends. AuthMe 6 logs
++//! players in with one. Like the resource pack prompt it covers the world and takes the mouse; it
++//! also takes the keyboard for its text inputs.
++use super::Game;
++use horizon_client::{
++    dialog::{Action, After, Control, Dialog, Form, Outcome, Value},
++    dialog_ui::{self, Hit, Placed},
++    hud::{HudAtlas, HudBatch, rgba},
++    text::Text,
++    ui, widgets,
++};
++use horizon_protocol::{dialog::CustomClickAction, dialog::DialogRef};
++use horizon_world::nbt::Tag;
++use std::time::Instant;
++
++/// A dialog being shown, and what the player has put into it.
++pub(super) struct ActiveDialog {
++    dialog: Dialog,
++    form: Form,
++    /// The text input that takes the keyboard.
++    focus: Option<usize>,
++    /// Pressed, and the server hasn't answered yet.
++    waiting: bool,
++    shown: Instant,
++}
++
++impl ActiveDialog {
++    fn new(dialog: Dialog) -> Self {
++        let focus = dialog
++            .inputs
++            .iter()
++            .position(|input| matches!(input.control, Control::Text { .. }));
++        Self {
++            form: Form::new(&dialog),
++            dialog,
++            focus,
++            waiting: false,
++            shown: Instant::now(),
++        }
++    }
++
++    fn placed(&self, atlas: &HudAtlas, size: (f32, f32)) -> Placed {
++        dialog_ui::place(&self.dialog, size, &|text| {
++            HudBatch::text_width(atlas, text)
++        })
++    }
++}
++
++/// What a control shows as its label on a button.
++fn state_label(input: &horizon_client::dialog::Input, value: Option<&Value>) -> String {
++    let shown = match (&input.control, value) {
++        (
++            Control::Boolean {
++                on_true, on_false, ..
++            },
++            Some(Value::Bool(on)),
++        ) => {
++            if *on {
++                on_true.clone()
++            } else {
++                on_false.clone()
++            }
++        }
++        (Control::Choice { options, .. }, Some(Value::Choice(at))) => options
++            .get(*at)
++            .map(|(_, shown)| shown.clone())
++            .unwrap_or_default(),
++        (Control::Range { .. }, Some(Value::Range(v))) => {
++            if v.fract() == 0.0 {
++                format!("{v:.0}")
++            } else {
++                format!("{v:.2}")
++            }
++        }
++        _ => String::new(),
++    };
++    if input.label.is_empty() {
++        shown
++    } else {
++        format!("{}: {shown}", input.label)
++    }
++}
++
++impl Game<'_> {
++    pub(super) fn dialog_open(&self) -> bool {
++        self.remote.as_ref().is_some_and(|r| r.dialog.is_some())
++    }
++
++    /// Whether a text input of the dialog has the keyboard.
++    pub(super) fn dialog_text_focused(&self) -> bool {
++        self.remote
++            .as_ref()
++            .and_then(|r| r.dialog.as_ref())
++            .is_some_and(|d| d.focus.is_some() && !d.waiting)
++    }
++
++    /// How many characters the focused text input holds.
++    pub(super) fn dialog_text_len(&self) -> usize {
++        self.remote
++            .as_ref()
++            .and_then(|r| r.dialog.as_ref())
++            .and_then(|d| d.focus.and_then(|i| d.form.value(i)))
++            .map_or(0, |value| match value {
++                Value::Text(text) => text.chars().count(),
++                _ => 0,
++            })
++    }
++
++    /// Shows the dialog in `tag`, in place of the one shown.
++    pub(super) fn show_dialog(&mut self, tag: &Tag) {
++        let Some(r) = self.remote.as_mut() else {
++            return;
++        };
++        log::debug!("Horizon: server dialog data: {tag:?}");
++        let dialog = Dialog::read(tag, &r.lang);
++        log::info!(
++            "Horizon: server dialog \"{}\": {} inputs, {} buttons",
++            dialog.title,
++            dialog.inputs.len(),
++            dialog.all_buttons().count()
++        );
++        r.dialog = Some(ActiveDialog::new(dialog));
++        self.capture(false);
++    }
++
++    /// The same, for a dialog the server gives by its id in the registries it sent.
++    pub(super) fn show_dialog_ref(&mut self, dialog: DialogRef) {
++        let tag = match dialog {
++            DialogRef::Inline(tag) => Some(tag),
++            DialogRef::Registry(id) => self
++                .remote
++                .as_ref()
++                .and_then(|r| r.registries.data("minecraft:dialog", id).cloned()),
++        };
++        match tag {
++            Some(tag) => self.show_dialog(&tag),
++            None => log::warn!("Horizon: the server showed a dialog this client has no entry for"),
++        }
++    }
++
++    /// ClientboundClearDialogPacket, or the player closing it.
++    pub(super) fn clear_dialog(&mut self) {
++        let Some(r) = self.remote.as_mut() else {
++            return;
++        };
++        if r.dialog.take().is_some()
++            && self.player.is_some()
++            && self.screen == super::Screen::Playing
++        {
++            self.capture(true);
++        }
++    }
++
++    pub(super) fn draw_dialog(&self, batch: &mut HudBatch) {
++        let Some(active) = self.remote.as_ref().and_then(|r| r.dialog.as_ref()) else {
++            return;
++        };
++        let atlas = &self.gui.atlas;
++        let (w, h) = (batch.width, batch.height);
++        if self.player.is_none() {
++            // In place of the connecting screen, on its background.
++            batch.fill(atlas, 0.0, 0.0, w, h, rgba(20, 20, 20, 255));
++        }
++        ui::menu_background(batch, atlas, 0.0, 0.0, w, h, self.player.is_some());
++        let placed = active.placed(atlas, (w, h));
++        let white = u32::MAX;
++        let gray = rgba(170, 170, 170, 255);
++        let dialog = &active.dialog;
++        let cursor = self.cursor;
++        if let Some((title, y)) = &placed.title {
++            let width = HudBatch::text_width(atlas, title);
++            batch.text(
++                atlas,
++                title,
++                placed.center_x - (width / 2.0).floor(),
++                *y,
++                white,
++                true,
++            );
++        }
++        for (line, y) in &placed.lines {
++            let width = HudBatch::text_width(atlas, line);
++            batch.text(
++                atlas,
++                line,
++                placed.center_x - (width / 2.0).floor(),
++                *y,
++                gray,
++                true,
++            );
++        }
++        if placed.cut {
++            batch.text(atlas, "...", placed.center_x - 9.0, h - 10.0, gray, true);
++        }
++        for (i, (input, spot)) in dialog.inputs.iter().zip(&placed.inputs).enumerate() {
++            if let Some((label, y)) = &spot.label {
++                batch.text(atlas, label, spot.rect[0], *y, gray, true);
++            }
++            let [x, y, width, height] = spot.rect;
++            match &input.control {
++                Control::Text { .. } => {
++                    let focused = active.focus == Some(i) && !active.waiting;
++                    // A tap on a text field asks for the keyboard.
++                    widgets::target_as(spot.rect, widgets::Kind::Field);
++                    let sprite = if focused {
++                        "gui/sprites/widget/text_field_highlighted"
++                    } else {
++                        "gui/sprites/widget/text_field"
++                    };
++                    ui::nine_slice(batch, atlas, sprite, x, y, width, height, white);
++                    let value = match active.form.value(i) {
++                        Some(Value::Text(text)) => text.as_str(),
++                        _ => "",
++                    };
++                    // The end of what fits is the part that shows.
++                    let room = width - 8.0;
++                    let mut shown = value;
++                    while HudBatch::text_width(atlas, shown) > room {
++                        let mut chars = shown.chars();
++                        chars.next();
++                        shown = chars.as_str();
++                    }
++                    batch.text(atlas, shown, x + 4.0, y + (height - 8.0) / 2.0, white, true);
++                    if focused && (active.shown.elapsed().as_millis() / 500) % 2 == 0 {
++                        let caret = x + 4.0 + HudBatch::text_width(atlas, shown);
++                        batch.fill(atlas, caret, y + 5.0, 1.0, height - 10.0, white);
++                    }
++                }
++                _ => {
++                    let label = Text::literal(state_label(input, active.form.value(i)));
++                    let hover = ui::hovered(cursor, x, y, width, height) && !active.waiting;
++                    ui::button(
++                        batch,
++                        atlas,
++                        x,
++                        y,
++                        width,
++                        height,
++                        &label,
++                        !active.waiting,
++                        hover,
++                    );
++                }
++            }
++        }
++        for (button, rect) in dialog.all_buttons().zip(&placed.buttons) {
++            let [x, y, width, height] = *rect;
++            let label = Text::literal(button.label.clone());
++            let hover = ui::hovered(cursor, x, y, width, height) && !active.waiting;
++            ui::button(
++                batch,
++                atlas,
++                x,
++                y,
++                width,
++                height,
++                &label,
++                !active.waiting,
++                hover,
++            );
++        }
++        if active.waiting {
++            let text = "Waiting for the server...";
++            let width = HudBatch::text_width(atlas, text);
++            batch.text(
++                atlas,
++                text,
++                placed.center_x - (width / 2.0).floor(),
++                h - 14.0,
++                gray,
++                true,
++            );
++        }
++    }
++
++    /// A left click on the dialog: what it hit.
++    pub(super) fn dialog_click(&mut self) {
++        let size = self.gui_size();
++        let cursor = self.cursor;
++        let Some(active) = self.remote.as_ref().and_then(|r| r.dialog.as_ref()) else {
++            return;
++        };
++        if active.waiting {
++            return;
++        }
++        let placed = active.placed(&self.gui.atlas, size);
++        match placed.hit(cursor.0, cursor.1) {
++            Some(Hit::Button(n)) => {
++                self.audio.play_button_click();
++                self.press_dialog_button(n);
++            }
++            Some(Hit::Input(i)) => {
++                let rect = placed.inputs[i].rect;
++                let Some(active) = self.remote.as_mut().and_then(|r| r.dialog.as_mut()) else {
++                    return;
++                };
++                let Active {
++                    dialog,
++                    form,
++                    focus,
++                    ..
++                } = Active::split(active);
++                match dialog.inputs.get(i).map(|input| &input.control) {
++                    Some(Control::Text { .. }) => {
++                        *focus = Some(i);
++                        self.request_keyboard();
++                    }
++                    Some(Control::Range { .. }) => {
++                        let share = (cursor.0 - rect[0]) / rect[2].max(1.0);
++                        form.set_range(dialog, i, share);
++                    }
++                    Some(_) => {
++                        form.toggle(dialog, i);
++                        self.audio.play_button_click();
++                    }
++                    None => {}
++                }
++            }
++            None => {}
++        }
++    }
++
++    /// Presses button `n` (the way out last), and does what it asks for.
++    fn press_dialog_button(&mut self, n: usize) {
++        let Some(active) = self.remote.as_ref().and_then(|r| r.dialog.as_ref()) else {
++            return;
++        };
++        let Some(button) = active.dialog.all_buttons().nth(n) else {
++            return;
++        };
++        let outcome = active.form.press(&active.dialog, button);
++        let after = active.dialog.after;
++        let replaced = matches!(outcome, Outcome::Show(_));
++        match outcome {
++            Outcome::Nothing => {}
++            Outcome::Send { id, payload } => {
++                if let Some(r) = &self.remote {
++                    r.session
++                        .send_dialog_click(CustomClickAction { id, payload });
++                }
++            }
++            Outcome::Show(tag) => self.show_dialog(&tag),
++            Outcome::RunCommand(command) => {
++                if self.player.is_some() {
++                    self.send_chat(&format!("/{command}"));
++                }
++            }
++            Outcome::SuggestCommand(_) | Outcome::OpenUrl(_) | Outcome::CopyToClipboard(_) => {
++                log::info!(
++                    "Horizon: a dialog button asked for something this client doesn't do yet"
++                );
++            }
++        }
++        if replaced {
++            return;
++        }
++        match after {
++            After::Close => self.clear_dialog(),
++            After::Wait => {
++                if let Some(a) = self.remote.as_mut().and_then(|r| r.dialog.as_mut()) {
++                    a.waiting = true;
++                }
++            }
++            After::Nothing => {}
++        }
++    }
++
++    /// Escape: closes a dialog that can be closed.
++    pub(super) fn dialog_escape(&mut self) {
++        let closes = self
++            .remote
++            .as_ref()
++            .and_then(|r| r.dialog.as_ref())
++            .is_some_and(|d| d.dialog.escape_closes && !d.waiting);
++        if closes {
++            self.clear_dialog();
++        }
++    }
++
++    /// Typed text goes into the input that has the keyboard.
++    pub(super) fn dialog_type(&mut self, text: &str) {
++        if let Some(active) = self.remote.as_mut().and_then(|r| r.dialog.as_mut()) {
++            let Active {
++                dialog,
++                form,
++                focus,
++                waiting,
++            } = Active::split(active);
++            if let (Some(i), false) = (*focus, *waiting) {
++                form.type_text(dialog, i, text);
++            }
++        }
++    }
++
++    pub(super) fn dialog_backspace(&mut self) {
++        if let Some(active) = self.remote.as_mut().and_then(|r| r.dialog.as_mut())
++            && let (Some(i), false) = (active.focus, active.waiting)
++        {
++            active.form.backspace(i);
++        }
++    }
++
++    /// Enter: the first button, as a login form's Enter would.
++    pub(super) fn dialog_enter(&mut self) {
++        let sendable = self
++            .remote
++            .as_ref()
++            .and_then(|r| r.dialog.as_ref())
++            .is_some_and(|d| {
++                !d.waiting
++                    && d.dialog
++                        .buttons
++                        .first()
++                        .is_some_and(|b| matches!(b.action, Action::Custom { .. }))
++            });
++        if sendable {
++            self.press_dialog_button(0);
++        }
++    }
++
++    /// Tab: the next text input.
++    pub(super) fn dialog_next_input(&mut self) {
++        let Some(active) = self.remote.as_mut().and_then(|r| r.dialog.as_mut()) else {
++            return;
++        };
++        let texts: Vec<usize> = active
++            .dialog
++            .inputs
++            .iter()
++            .enumerate()
++            .filter(|(_, i)| matches!(i.control, Control::Text { .. }))
++            .map(|(n, _)| n)
++            .collect();
++        if texts.len() > 1 {
++            let at = texts
++                .iter()
++                .position(|n| Some(*n) == active.focus)
++                .unwrap_or(0);
++            active.focus = Some(texts[(at + 1) % texts.len()]);
++        }
++    }
++}
++
++/// The parts of an [`ActiveDialog`] a click changes, borrowed together.
++struct Active<'a> {
++    dialog: &'a Dialog,
++    form: &'a mut Form,
++    focus: &'a mut Option<usize>,
++    waiting: &'a mut bool,
++}
++
++impl<'a> Active<'a> {
++    fn split(active: &'a mut ActiveDialog) -> Self {
++        Self {
++            dialog: &active.dialog,
++            form: &mut active.form,
++            focus: &mut active.focus,
++            waiting: &mut active.waiting,
++        }
++    }
++}
+diff --git a/crates/horizon-client/src/game/remote.rs b/crates/horizon-client/src/game/remote.rs
+index eaf5fa7..0d3717a 100644
+--- a/crates/horizon-client/src/game/remote.rs
++++ b/crates/horizon-client/src/game/remote.rs
+@@ -102,8 +102,10 @@ pub(super) struct Remote {
+     pub session: Session,
+     pub brand: String,
+     pub(super) builtin: Arc<Builtin>,
+-    lang: Arc<Language>,
++    pub(super) lang: Arc<Language>,
+     pub(super) registries: Arc<Dynamic>,
++    /// The dialog the server is showing.
++    pub(super) dialog: Option<super::dialogs::ActiveDialog>,
+     joined: bool,
+     status: String,
+     pub(super) entity_id: i32,
+@@ -389,6 +391,7 @@ impl Game<'_> {
+             builtin: Arc::new(builtin),
+             lang,
+             registries: Arc::new(Dynamic::default()),
++            dialog: None,
+             joined: false,
+             status: "Connecting to the server...".into(),
+             entity_id: 0,
+@@ -859,6 +862,8 @@ impl Game<'_> {
+                 }
+                 Event::Reconfigured(registries) => self.set_registries(registries),
+                 Event::PackPush(p) => self.handle_pack_push(p),
++                Event::Dialog(tag) => self.show_dialog(&tag),
++                Event::ClearDialog => self.clear_dialog(),
+                 Event::PackPop(id) => self.handle_pack_pop(id),
+                 Event::DecodeError(e) => {
+                     if let Some(r) = self.remote.as_mut() {
+@@ -2457,6 +2462,8 @@ impl Game<'_> {
+                 }
+             }
+             C::OpenScreen(p) => self.remote_open_screen(p),
++            C::ShowDialog(p) => self.show_dialog_ref(p.dialog),
++            C::ClearDialog(_) => self.clear_dialog(),
+             C::MountScreenOpen(p) => self.remote_open_mount(p),
+             C::RecipeBookAdd(p) => self.remote_recipe_book_add(p),
+             C::RecipeBookRemove(p) => self.remote_recipe_book_remove(p),
+diff --git a/crates/horizon-client/src/game/touch.rs b/crates/horizon-client/src/game/touch.rs
+index 2bb7042..e444e03 100644
+--- a/crates/horizon-client/src/game/touch.rs
++++ b/crates/horizon-client/src/game/touch.rs
+@@ -306,7 +306,7 @@ impl Game<'_> {
+     fn touch_context(&self) -> Context {
+         let mode = if self.title.is_some() {
+             Mode::Title
+-        } else if self.pad_in_menu() || self.server_packs.prompt.is_some() {
++        } else if self.pad_in_menu() || self.server_packs.prompt.is_some() || self.dialog_open() {
+             Mode::Menu
+         } else {
+             Mode::Playing
+diff --git a/crates/horizon-client/src/game/typing.rs b/crates/horizon-client/src/game/typing.rs
+index 16be60f..b37398b 100644
+--- a/crates/horizon-client/src/game/typing.rs
++++ b/crates/horizon-client/src/game/typing.rs
+@@ -30,6 +30,8 @@ pub(super) enum Field {
+     Title,
+     /// The profile picker's name box: a screen made for typing, so the keyboard opens with it.
+     Profile,
++    /// A text input of a server's dialog (AuthMe's password): the keyboard opens with the dialog.
++    Dialog,
+ }
+ 
+ impl Field {
+@@ -38,7 +40,12 @@ impl Field {
+     fn opens_keyboard(self) -> bool {
+         matches!(
+             self,
+-            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock | Field::Profile
++            Field::Chat
++                | Field::Sign
++                | Field::Book
++                | Field::CommandBlock
++                | Field::Profile
++                | Field::Dialog
+         )
+     }
+     /// Enter ends the typing here; on a sign or a book's page it starts the next line.
+@@ -174,6 +181,10 @@ impl Game<'_> {
+     /// The field of the screen that takes the keys, in the order `window_event` gives them to
+     /// the screens. The options', World Options' and the title's may not have the focus.
+     pub(super) fn front_field(&self) -> Option<Field> {
++        // A server's dialog covers everything, and has the keyboard for its text inputs.
++        if self.dialog_open() {
++            return self.dialog_text_focused().then_some(Field::Dialog);
++        }
+         if self.pending_entry.is_some()
+             || self.world_loader.is_some()
+             || self.pending_save.is_some()
+@@ -221,7 +232,7 @@ impl Game<'_> {
+             Field::WorldOptions => self.world_options_typing(),
+             Field::Options => self.ui.options.typing(),
+             Field::Title => self.title.as_ref().is_some_and(|t| t.typing()),
+-            Field::Profile => true,
++            Field::Profile | Field::Dialog => true,
+             _ => true,
+         };
+         focused.then_some(field)
+@@ -293,6 +304,11 @@ impl Game<'_> {
+                 }
+                 _ => self.title_edit(text, backspace),
+             },
++            Field::Dialog => match &edit {
++                Edit::Text(text) => self.dialog_type(text),
++                Edit::Backspace => self.dialog_backspace(),
++                Edit::Enter => self.dialog_enter(),
++            },
+         }
+     }
+ 
+@@ -319,6 +335,12 @@ impl Game<'_> {
+                 }
+                 return;
+             }
++            Field::Dialog => {
++                while self.dialog_text_focused() && self.dialog_text_len() > 0 {
++                    self.dialog_backspace();
++                }
++                return;
++            }
+         }
+         self.edit_field(field, Edit::Backspace);
+     }
+@@ -502,6 +524,7 @@ mod tests {
+             (Options, false, false),
+             (Title, false, false),
+             (Profile, true, false),
++            (Dialog, true, false),
+         ];
+         for (field, opens, keeps) in policies {
+             assert_eq!(
+diff --git a/crates/horizon-client/src/lib.rs b/crates/horizon-client/src/lib.rs
+index 854a48f..fddbfa4 100644
+--- a/crates/horizon-client/src/lib.rs
++++ b/crates/horizon-client/src/lib.rs
+@@ -53,6 +53,8 @@ pub mod datapack;
+ pub mod debug_chart;
+ pub mod debug_keys;
+ pub mod debug_overlay;
++pub mod dialog;
++pub mod dialog_ui;
+ pub mod dynamic_light;
+ pub mod effects;
+ pub mod enchant;
+diff --git a/crates/horizon-client/src/net.rs b/crates/horizon-client/src/net.rs
+index 9cce9e1..3ece633 100644
+--- a/crates/horizon-client/src/net.rs
++++ b/crates/horizon-client/src/net.rs
+@@ -11,12 +11,14 @@ use horizon_protocol::{
+     PROTOCOL_VERSION,
+     connection::{ConnReader, ConnWriter, Connection, Counters},
+     crypto::{generate_secret, offline_uuid, server_hash},
++    dialog::{CustomClickAction, DialogRef},
+     packets::{Empty, configuration as cfg, handshake, login, play},
+     registry::Dynamic,
+     rsa::RsaPublicKey,
+     servers::parse_address,
+     text::{Language, plain, translatable},
+ };
++use horizon_world::nbt::Tag;
+ use std::{
+     sync::{
+         Arc, Mutex,
+@@ -48,6 +50,11 @@ pub enum Event {
+     PackPush(cfg::ResourcePackPush),
+     /// ClientboundResourcePackPopPacket: one pack, or every pack.
+     PackPop(Option<u128>),
++    /// ClientboundShowDialogPacket in configuration, with the dialog's NBT (one given by a
++    /// registry id is looked up here, in the registries received so far).
++    Dialog(Tag),
++    /// ClientboundClearDialogPacket in configuration.
++    ClearDialog,
+     /// The connection ended. `from_server`: the server gave the reason (or
+     /// the connection was refused for good), rather than the connection
+     /// failing (auto-reconnect retries only failures and shutdowns).
+@@ -174,6 +181,21 @@ impl Session {
+             w.shutdown();
+         }
+     }
++    /// ServerboundCustomClickActionPacket, in whichever phase the connection is: the answer to a
++    /// dialog's button.
++    pub fn send_dialog_click(&self, click: CustomClickAction) {
++        let mut writer = self.writer.lock().unwrap();
++        let body = if self.configuring.load(Ordering::Relaxed) {
++            cfg::Serverbound::CustomClickAction(click).encode()
++        } else {
++            play::Serverbound::CustomClickAction(click).encode()
++        };
++        if let Some(w) = writer.as_mut()
++            && w.send(&body).is_err()
++        {
++            w.shutdown();
++        }
++    }
+     /// ServerboundResourcePackPacket, in whichever phase the connection is.
+     pub fn send_pack_status(&self, id: u128, action: i32) {
+         let status = cfg::ResourcePackResponse { id, action };
+@@ -524,6 +546,20 @@ fn configure(
+             cfg::Clientbound::ResourcePackPop(p) => {
+                 let _ = send.send(Event::PackPop(p.id));
+             }
++            // A dialog (AuthMe's login before joining): the game shows it, and answers with
++            // `Session::send_dialog_click`.
++            cfg::Clientbound::ShowDialog(d) => {
++                let dialog = match d.dialog {
++                    DialogRef::Inline(tag) => Some(tag),
++                    DialogRef::Registry(id) => registries.data("minecraft:dialog", id).cloned(),
++                };
++                if let Some(tag) = dialog {
++                    let _ = send.send(Event::Dialog(tag));
++                }
++            }
++            cfg::Clientbound::ClearDialog(_) => {
++                let _ = send.send(Event::ClearDialog);
++            }
+             cfg::Clientbound::CookieRequest(q) => {
+                 reply(cfg::Serverbound::CookieResponse(cfg::CookieResponse {
+                     key: q.key,
+@@ -749,6 +785,156 @@ mod tests {
+         assert!(thread.join().unwrap().is_err());
+     }
+ 
++    fn dialog_tag(title: &str) -> Tag {
++        Tag::compound([
++            ("type", Tag::String("minecraft:notice".into())),
++            ("title", Tag::String(title.into())),
++        ])
++    }
++
++    fn session_on(
++        events: Receiver<Event>,
++        writer: Arc<Mutex<Option<ConnWriter>>>,
++        configuring: bool,
++    ) -> Session {
++        Session {
++            events,
++            writer,
++            configuring: Arc::new(AtomicBool::new(configuring)),
++            thread: None,
++            address: "local".into(),
++            name: "Player".into(),
++            counters: Arc::new(Mutex::new(None)),
++            debug: false,
++        }
++    }
++
++    #[test]
++    fn a_dialog_in_configuration_reaches_the_game_and_the_answer_goes_back_as_configuration() {
++        use horizon_protocol::dialog::{CustomClickAction, DialogRef, ShowDialog};
++        let (client, server) = horizon_protocol::connection::Pipe::pair();
++        let (mut reader, writer) = Connection::local(client).split();
++        let writer = Arc::new(Mutex::new(Some(writer)));
++        let configuring = Arc::new(AtomicBool::new(true));
++        let (send, events) = channel();
++        let (thread_writer, thread_configuring) = (writer.clone(), configuring.clone());
++        let thread = std::thread::spawn(move || {
++            configure(
++                &mut reader,
++                &thread_writer,
++                &thread_configuring,
++                &Language::new(),
++                &send,
++            )
++        });
++        let mut server = Connection::local(server);
++        let timeout = Duration::from_secs(5);
++        // A dialog the server sends whole.
++        let login = dialog_tag("Login");
++        server
++            .send(
++                &cfg::Clientbound::ShowDialog(ShowDialog {
++                    dialog: DialogRef::Inline(login.clone()),
++                })
++                .encode(),
++            )
++            .unwrap();
++        assert!(matches!(events.recv_timeout(timeout).unwrap(), Event::Dialog(t) if t == login));
++        // One it names by its place in the registry it sent before.
++        let registered = dialog_tag("Registered");
++        server
++            .send(
++                &cfg::Clientbound::RegistryData(cfg::RegistryData {
++                    registry: "minecraft:dialog".into(),
++                    entries: vec![cfg::RegistryEntry {
++                        id: "example:registered".into(),
++                        data: Some(registered.clone()),
++                    }],
++                })
++                .encode(),
++            )
++            .unwrap();
++        server
++            .send(
++                &cfg::Clientbound::ShowDialog(ShowDialog {
++                    dialog: DialogRef::Registry(0),
++                })
++                .encode(),
++            )
++            .unwrap();
++        assert!(
++            matches!(events.recv_timeout(timeout).unwrap(), Event::Dialog(t) if t == registered)
++        );
++        server
++            .send(&cfg::Clientbound::ClearDialog(Empty).encode())
++            .unwrap();
++        assert!(matches!(
++            events.recv_timeout(timeout).unwrap(),
++            Event::ClearDialog
++        ));
++        // The player's answer goes out in configuration, while the server waits for it.
++        let session = session_on(events, writer.clone(), true);
++        let click = CustomClickAction {
++            id: "authme:login".into(),
++            payload: Some(Tag::compound([("password", Tag::String("secret".into()))])),
++        };
++        session.send_dialog_click(click.clone());
++        let (id, body) = server.recv().unwrap();
++        assert_eq!(
++            cfg::Serverbound::decode(id, &body).unwrap(),
++            cfg::Serverbound::CustomClickAction(click)
++        );
++        // Configuration goes on past the dialog.
++        server
++            .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
++            .unwrap();
++        let (id, body) = server.recv().unwrap();
++        assert_eq!(
++            cfg::Serverbound::decode(id, &body).unwrap(),
++            cfg::Serverbound::FinishConfiguration(Empty)
++        );
++        assert!(thread.join().unwrap().is_ok());
++    }
++
++    #[test]
++    fn a_dialog_answer_in_play_goes_out_as_a_play_packet_and_a_play_dialog_reaches_the_game() {
++        use horizon_protocol::dialog::{CustomClickAction, DialogRef, ShowDialog};
++        let (client, server) = horizon_protocol::connection::Pipe::pair();
++        let (mut reader, writer) = Connection::local(client).split();
++        let writer = Arc::new(Mutex::new(Some(writer)));
++        let (send, events) = channel();
++        let thread_writer = writer.clone();
++        let thread = std::thread::spawn(move || {
++            receive_play(
++                &mut reader,
++                &thread_writer,
++                &AtomicBool::new(false),
++                &Language::new(),
++                &send,
++            )
++        });
++        let mut server = Connection::local(server);
++        let show = play::Clientbound::ShowDialog(ShowDialog {
++            dialog: DialogRef::Inline(dialog_tag("Register")),
++        });
++        server.send(&show.encode()).unwrap();
++        let timeout = Duration::from_secs(5);
++        assert!(matches!(events.recv_timeout(timeout).unwrap(), Event::Packet(p) if *p == show));
++        let session = session_on(events, writer.clone(), false);
++        let click = CustomClickAction {
++            id: "authme:register".into(),
++            payload: None,
++        };
++        session.send_dialog_click(click.clone());
++        let (id, body) = server.recv().unwrap();
++        assert_eq!(
++            play::Serverbound::decode(id, &body).unwrap(),
++            play::Serverbound::CustomClickAction(click)
++        );
++        writer.lock().unwrap().take().unwrap().shutdown();
++        assert!(thread.join().unwrap().is_err());
++    }
++
+     #[test]
+     fn server_brand_payload_is_decoded_and_invalid_or_unrelated_payloads_are_ignored() {
+         let (send, events) = channel();
+-- 
+2.43.0
+
