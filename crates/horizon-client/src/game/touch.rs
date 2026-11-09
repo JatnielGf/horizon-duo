@@ -306,7 +306,7 @@ impl Game<'_> {
     fn touch_context(&self) -> Context {
         let mode = if self.title.is_some() {
             Mode::Title
-        } else if self.pad_in_menu() || self.server_packs.prompt.is_some() {
+        } else if self.pad_in_menu() || self.server_packs.prompt.is_some() || self.dialog_open() {
             Mode::Menu
         } else {
             Mode::Playing

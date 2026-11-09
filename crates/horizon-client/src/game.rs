@@ -36,6 +36,7 @@ mod debug_keys;
 mod decorated_pot;
 mod dedicated;
 mod deflect;
+mod dialogs;
 mod dispense_fixture;
 mod dispenser;
 mod dragon;
@@ -1208,6 +1209,8 @@ struct Covers {
     /// A server's resource pack prompt (`PackConfirmScreen`): when it goes, the screen it covered
     /// is the same one.
     pack_prompt: bool,
+    /// A server's dialog.
+    dialog: bool,
     book: bool,
     sign: bool,
 }
@@ -1217,11 +1220,12 @@ fn inventory_takes_mouse(screen: Screen, covers: Covers) -> bool {
     let Covers {
         title,
         pack_prompt,
+        dialog,
         book,
         sign,
     } = covers;
     matches!(screen, Screen::Inventory | Screen::Creative)
-        && !(title.is_some() || pack_prompt || book || sign)
+        && !(title.is_some() || pack_prompt || dialog || book || sign)
 }
 
 /// A furnace screen's texture and title.
@@ -5024,12 +5028,15 @@ impl Game<'_> {
         self.preview_deal();
         // The pack prompt replaces the connecting screen (setScreen), but
         // in game it opens over the world.
-        let mut batch = if self.server_packs.prompt.is_some() && self.player.is_none() {
+        let mut batch = if (self.server_packs.prompt.is_some() || self.dialog_open())
+            && self.player.is_none()
+        {
             HudBatch::new(size)
         } else {
             self.hud_layers(size)
         };
         self.draw_pack_prompt(&mut batch);
+        self.draw_dialog(&mut batch);
         // Gui.extractRenderState: the debug overlay comes after the screen
         // and the toasts, so it is over everything, menus included.
         self.draw_debug_overlay(&mut batch, size);
@@ -5709,6 +5716,7 @@ impl Game<'_> {
         Covers {
             title: self.title.as_ref().map(title_page),
             pack_prompt: self.server_packs.prompt.is_some(),
+            dialog: self.dialog_open(),
             book: self.book.is_some(),
             sign: self.sign_edit.is_some(),
         }
@@ -11367,6 +11375,11 @@ impl ApplicationHandler for Game<'_> {
                     }
                     self.screen_wheel(scaled(raw_x) as f32, d);
                 }
+                WindowEvent::MouseInput { state, button, .. } if self.dialog_open() => {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        self.dialog_click();
+                    }
+                }
                 WindowEvent::MouseInput { state, button, .. }
                     if self.server_packs.prompt.is_some() =>
                 {
@@ -11566,6 +11579,27 @@ impl ApplicationHandler for Game<'_> {
                             self.stats_click(size);
                         }
                         _ => {}
+                    }
+                }
+                // A server's dialog takes the keys: Escape closes one that can be, Enter presses
+                // its first button, Tab moves between its text inputs.
+                WindowEvent::KeyboardInput { event, .. } if self.dialog_open() => {
+                    if event.state == ElementState::Pressed {
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => self.dialog_escape(),
+                            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                                self.dialog_enter()
+                            }
+                            PhysicalKey::Code(KeyCode::Tab) => self.dialog_next_input(),
+                            PhysicalKey::Code(KeyCode::Backspace) => self.dialog_backspace(),
+                            PhysicalKey::Code(_) => {
+                                if let Some(text) = &event.text {
+                                    self.dialog_type(text);
+                                }
+                            }
+                            // The system keyboard's text arrives through the typing field.
+                            _ => {}
+                        }
                     }
                 }
                 // ConfirmScreen.keyPressed: Escape answers no.

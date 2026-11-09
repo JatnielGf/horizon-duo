@@ -30,6 +30,8 @@ pub(super) enum Field {
     Title,
     /// The profile picker's name box: a screen made for typing, so the keyboard opens with it.
     Profile,
+    /// A text input of a server's dialog (AuthMe's password): the keyboard opens with the dialog.
+    Dialog,
 }
 
 impl Field {
@@ -38,7 +40,12 @@ impl Field {
     fn opens_keyboard(self) -> bool {
         matches!(
             self,
-            Field::Chat | Field::Sign | Field::Book | Field::CommandBlock | Field::Profile
+            Field::Chat
+                | Field::Sign
+                | Field::Book
+                | Field::CommandBlock
+                | Field::Profile
+                | Field::Dialog
         )
     }
     /// Enter ends the typing here; on a sign or a book's page it starts the next line.
@@ -174,6 +181,10 @@ impl Game<'_> {
     /// The field of the screen that takes the keys, in the order `window_event` gives them to
     /// the screens. The options', World Options' and the title's may not have the focus.
     pub(super) fn front_field(&self) -> Option<Field> {
+        // A server's dialog covers everything, and has the keyboard for its text inputs.
+        if self.dialog_open() {
+            return self.dialog_text_focused().then_some(Field::Dialog);
+        }
         if self.pending_entry.is_some()
             || self.world_loader.is_some()
             || self.pending_save.is_some()
@@ -221,7 +232,7 @@ impl Game<'_> {
             Field::WorldOptions => self.world_options_typing(),
             Field::Options => self.ui.options.typing(),
             Field::Title => self.title.as_ref().is_some_and(|t| t.typing()),
-            Field::Profile => true,
+            Field::Profile | Field::Dialog => true,
             _ => true,
         };
         focused.then_some(field)
@@ -293,6 +304,11 @@ impl Game<'_> {
                 }
                 _ => self.title_edit(text, backspace),
             },
+            Field::Dialog => match &edit {
+                Edit::Text(text) => self.dialog_type(text),
+                Edit::Backspace => self.dialog_backspace(),
+                Edit::Enter => self.dialog_enter(),
+            },
         }
     }
 
@@ -316,6 +332,12 @@ impl Game<'_> {
             Field::Profile => {
                 if let Some(title) = self.title.as_mut() {
                     title.profile_clear();
+                }
+                return;
+            }
+            Field::Dialog => {
+                while self.dialog_text_focused() && self.dialog_text_len() > 0 {
+                    self.dialog_backspace();
                 }
                 return;
             }
@@ -502,6 +524,7 @@ mod tests {
             (Options, false, false),
             (Title, false, false),
             (Profile, true, false),
+            (Dialog, true, false),
         ];
         for (field, opens, keeps) in policies {
             assert_eq!(

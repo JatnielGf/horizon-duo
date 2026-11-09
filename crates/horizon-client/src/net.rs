@@ -11,12 +11,14 @@ use horizon_protocol::{
     PROTOCOL_VERSION,
     connection::{ConnReader, ConnWriter, Connection, Counters},
     crypto::{generate_secret, offline_uuid, server_hash},
+    dialog::{CustomClickAction, DialogRef},
     packets::{Empty, configuration as cfg, handshake, login, play},
     registry::Dynamic,
     rsa::RsaPublicKey,
     servers::parse_address,
     text::{Language, plain, translatable},
 };
+use horizon_world::nbt::Tag;
 use std::{
     sync::{
         Arc, Mutex,
@@ -48,6 +50,11 @@ pub enum Event {
     PackPush(cfg::ResourcePackPush),
     /// ClientboundResourcePackPopPacket: one pack, or every pack.
     PackPop(Option<u128>),
+    /// ClientboundShowDialogPacket in configuration, with the dialog's NBT (one given by a
+    /// registry id is looked up here, in the registries received so far).
+    Dialog(Tag),
+    /// ClientboundClearDialogPacket in configuration.
+    ClearDialog,
     /// The connection ended. `from_server`: the server gave the reason (or
     /// the connection was refused for good), rather than the connection
     /// failing (auto-reconnect retries only failures and shutdowns).
@@ -170,6 +177,21 @@ impl Session {
         }
         if let Some(w) = writer.as_mut()
             && w.send(&packet.encode()).is_err()
+        {
+            w.shutdown();
+        }
+    }
+    /// ServerboundCustomClickActionPacket, in whichever phase the connection is: the answer to a
+    /// dialog's button.
+    pub fn send_dialog_click(&self, click: CustomClickAction) {
+        let mut writer = self.writer.lock().unwrap();
+        let body = if self.configuring.load(Ordering::Relaxed) {
+            cfg::Serverbound::CustomClickAction(click).encode()
+        } else {
+            play::Serverbound::CustomClickAction(click).encode()
+        };
+        if let Some(w) = writer.as_mut()
+            && w.send(&body).is_err()
         {
             w.shutdown();
         }
@@ -524,6 +546,20 @@ fn configure(
             cfg::Clientbound::ResourcePackPop(p) => {
                 let _ = send.send(Event::PackPop(p.id));
             }
+            // A dialog (AuthMe's login before joining): the game shows it, and answers with
+            // `Session::send_dialog_click`.
+            cfg::Clientbound::ShowDialog(d) => {
+                let dialog = match d.dialog {
+                    DialogRef::Inline(tag) => Some(tag),
+                    DialogRef::Registry(id) => registries.data("minecraft:dialog", id).cloned(),
+                };
+                if let Some(tag) = dialog {
+                    let _ = send.send(Event::Dialog(tag));
+                }
+            }
+            cfg::Clientbound::ClearDialog(_) => {
+                let _ = send.send(Event::ClearDialog);
+            }
             cfg::Clientbound::CookieRequest(q) => {
                 reply(cfg::Serverbound::CookieResponse(cfg::CookieResponse {
                     key: q.key,
@@ -746,6 +782,156 @@ mod tests {
         let (id, body) = server.recv().unwrap();
         assert_eq!(play::Serverbound::decode(id, &body).unwrap(), tick_end);
         drop(session);
+        assert!(thread.join().unwrap().is_err());
+    }
+
+    fn dialog_tag(title: &str) -> Tag {
+        Tag::compound([
+            ("type", Tag::String("minecraft:notice".into())),
+            ("title", Tag::String(title.into())),
+        ])
+    }
+
+    fn session_on(
+        events: Receiver<Event>,
+        writer: Arc<Mutex<Option<ConnWriter>>>,
+        configuring: bool,
+    ) -> Session {
+        Session {
+            events,
+            writer,
+            configuring: Arc::new(AtomicBool::new(configuring)),
+            thread: None,
+            address: "local".into(),
+            name: "Player".into(),
+            counters: Arc::new(Mutex::new(None)),
+            debug: false,
+        }
+    }
+
+    #[test]
+    fn a_dialog_in_configuration_reaches_the_game_and_the_answer_goes_back_as_configuration() {
+        use horizon_protocol::dialog::{CustomClickAction, DialogRef, ShowDialog};
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        let writer = Arc::new(Mutex::new(Some(writer)));
+        let configuring = Arc::new(AtomicBool::new(true));
+        let (send, events) = channel();
+        let (thread_writer, thread_configuring) = (writer.clone(), configuring.clone());
+        let thread = std::thread::spawn(move || {
+            configure(
+                &mut reader,
+                &thread_writer,
+                &thread_configuring,
+                &Language::new(),
+                &send,
+            )
+        });
+        let mut server = Connection::local(server);
+        let timeout = Duration::from_secs(5);
+        // A dialog the server sends whole.
+        let login = dialog_tag("Login");
+        server
+            .send(
+                &cfg::Clientbound::ShowDialog(ShowDialog {
+                    dialog: DialogRef::Inline(login.clone()),
+                })
+                .encode(),
+            )
+            .unwrap();
+        assert!(matches!(events.recv_timeout(timeout).unwrap(), Event::Dialog(t) if t == login));
+        // One it names by its place in the registry it sent before.
+        let registered = dialog_tag("Registered");
+        server
+            .send(
+                &cfg::Clientbound::RegistryData(cfg::RegistryData {
+                    registry: "minecraft:dialog".into(),
+                    entries: vec![cfg::RegistryEntry {
+                        id: "example:registered".into(),
+                        data: Some(registered.clone()),
+                    }],
+                })
+                .encode(),
+            )
+            .unwrap();
+        server
+            .send(
+                &cfg::Clientbound::ShowDialog(ShowDialog {
+                    dialog: DialogRef::Registry(0),
+                })
+                .encode(),
+            )
+            .unwrap();
+        assert!(
+            matches!(events.recv_timeout(timeout).unwrap(), Event::Dialog(t) if t == registered)
+        );
+        server
+            .send(&cfg::Clientbound::ClearDialog(Empty).encode())
+            .unwrap();
+        assert!(matches!(
+            events.recv_timeout(timeout).unwrap(),
+            Event::ClearDialog
+        ));
+        // The player's answer goes out in configuration, while the server waits for it.
+        let session = session_on(events, writer.clone(), true);
+        let click = CustomClickAction {
+            id: "authme:login".into(),
+            payload: Some(Tag::compound([("password", Tag::String("secret".into()))])),
+        };
+        session.send_dialog_click(click.clone());
+        let (id, body) = server.recv().unwrap();
+        assert_eq!(
+            cfg::Serverbound::decode(id, &body).unwrap(),
+            cfg::Serverbound::CustomClickAction(click)
+        );
+        // Configuration goes on past the dialog.
+        server
+            .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
+            .unwrap();
+        let (id, body) = server.recv().unwrap();
+        assert_eq!(
+            cfg::Serverbound::decode(id, &body).unwrap(),
+            cfg::Serverbound::FinishConfiguration(Empty)
+        );
+        assert!(thread.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_dialog_answer_in_play_goes_out_as_a_play_packet_and_a_play_dialog_reaches_the_game() {
+        use horizon_protocol::dialog::{CustomClickAction, DialogRef, ShowDialog};
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        let writer = Arc::new(Mutex::new(Some(writer)));
+        let (send, events) = channel();
+        let thread_writer = writer.clone();
+        let thread = std::thread::spawn(move || {
+            receive_play(
+                &mut reader,
+                &thread_writer,
+                &AtomicBool::new(false),
+                &Language::new(),
+                &send,
+            )
+        });
+        let mut server = Connection::local(server);
+        let show = play::Clientbound::ShowDialog(ShowDialog {
+            dialog: DialogRef::Inline(dialog_tag("Register")),
+        });
+        server.send(&show.encode()).unwrap();
+        let timeout = Duration::from_secs(5);
+        assert!(matches!(events.recv_timeout(timeout).unwrap(), Event::Packet(p) if *p == show));
+        let session = session_on(events, writer.clone(), false);
+        let click = CustomClickAction {
+            id: "authme:register".into(),
+            payload: None,
+        };
+        session.send_dialog_click(click.clone());
+        let (id, body) = server.recv().unwrap();
+        assert_eq!(
+            play::Serverbound::decode(id, &body).unwrap(),
+            play::Serverbound::CustomClickAction(click)
+        );
+        writer.lock().unwrap().take().unwrap().shutdown();
         assert!(thread.join().unwrap().is_err());
     }
 

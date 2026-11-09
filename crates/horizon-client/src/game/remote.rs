@@ -102,8 +102,10 @@ pub(super) struct Remote {
     pub session: Session,
     pub brand: String,
     pub(super) builtin: Arc<Builtin>,
-    lang: Arc<Language>,
+    pub(super) lang: Arc<Language>,
     pub(super) registries: Arc<Dynamic>,
+    /// The dialog the server is showing.
+    pub(super) dialog: Option<super::dialogs::ActiveDialog>,
     joined: bool,
     status: String,
     pub(super) entity_id: i32,
@@ -389,6 +391,7 @@ impl Game<'_> {
             builtin: Arc::new(builtin),
             lang,
             registries: Arc::new(Dynamic::default()),
+            dialog: None,
             joined: false,
             status: "Connecting to the server...".into(),
             entity_id: 0,
@@ -859,6 +862,8 @@ impl Game<'_> {
                 }
                 Event::Reconfigured(registries) => self.set_registries(registries),
                 Event::PackPush(p) => self.handle_pack_push(p),
+                Event::Dialog(tag) => self.show_dialog(&tag),
+                Event::ClearDialog => self.clear_dialog(),
                 Event::PackPop(id) => self.handle_pack_pop(id),
                 Event::DecodeError(e) => {
                     if let Some(r) = self.remote.as_mut() {
@@ -2457,6 +2462,8 @@ impl Game<'_> {
                 }
             }
             C::OpenScreen(p) => self.remote_open_screen(p),
+            C::ShowDialog(p) => self.show_dialog_ref(p.dialog),
+            C::ClearDialog(_) => self.clear_dialog(),
             C::MountScreenOpen(p) => self.remote_open_mount(p),
             C::RecipeBookAdd(p) => self.remote_recipe_book_add(p),
             C::RecipeBookRemove(p) => self.remote_recipe_book_remove(p),
