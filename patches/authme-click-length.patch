@@ -1,0 +1,106 @@
+From 5def95699ce785b1b6745e7fbeef11fe4a41362b Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Tue, 10 Nov 2026 21:45:02 +0000
+Subject: [PATCH] Give a dialog's answer its length prefix
+
+The server still dropped the connection on the answer to a dialog button. The
+packet is an identifier and then lengthPrefixed(optionalTag): a VarInt with the
+tag's byte length, then the tag (or one End byte for none). Without the length the
+server read the first byte of the tag as the length. This replaces the previous
+change, which had left the length out.
+
+The tests lay out the exact bytes of an answer with and without values.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/horizon-protocol/src/dialog.rs | 39 +++++++++++++++------------
+ 1 file changed, 22 insertions(+), 17 deletions(-)
+
+diff --git a/crates/horizon-protocol/src/dialog.rs b/crates/horizon-protocol/src/dialog.rs
+index e8ed3b1..a16c664 100644
+--- a/crates/horizon-protocol/src/dialog.rs
++++ b/crates/horizon-protocol/src/dialog.rs
+@@ -92,26 +92,30 @@ packet!(
+     /// ClientboundShowDialogPacket (configuration and play).
+     ShowDialog { dialog: DialogRef => HolderDialog }
+ );
+-/// `ByteBufCodecs.optionalTagCodec`: a tag, or one `End` byte for none. There is no presence flag
+-/// in front, unlike `ByteBufCodecs.optional`; a server reads a flag as the type of the tag.
+-pub struct OptionalTag;
++/// An optional tag, as the click answer carries it: the tag's bytes behind a length (a VarInt, at
++/// most 65536), and an `End` byte for none. It is `optionalTagCodec` wrapped in `lengthPrefixed`;
++/// a server reads what follows the id as that length, so a presence flag or a bare tag there fails.
++pub struct PrefixedTag;
+ 
+-impl Codec<Option<Tag>> for OptionalTag {
++impl Codec<Option<Tag>> for PrefixedTag {
+     fn read(r: &mut Reader) -> Result<Option<Tag>> {
+-        Ok(match r.nbt()? {
++        let bytes = r.byte_array(65536)?;
++        Ok(match Reader::new(&bytes).nbt()? {
+             Tag::End => None,
+             tag => Some(tag),
+         })
+     }
+     fn write(v: &Option<Tag>, w: &mut Writer) {
+-        w.nbt(v.as_ref().unwrap_or(&Tag::End));
++        let mut inner = Writer::new();
++        inner.nbt(v.as_ref().unwrap_or(&Tag::End));
++        w.byte_array(&inner.data);
+     }
+ }
+ 
+ packet!(
+     /// ServerboundCustomClickActionPacket (configuration and play): the id of a button's custom
+     /// action, with the values of the dialog's inputs (or the action's own payload).
+-    CustomClickAction { id: String => Ident, payload: Option<Tag> => OptionalTag }
++    CustomClickAction { id: String => Ident, payload: Option<Tag> => PrefixedTag }
+ );
+ 
+ #[cfg(test)]
+@@ -223,8 +227,8 @@ mod tests {
+ 
+     #[test]
+     fn the_answer_is_laid_out_the_way_a_server_reads_it() {
+-        // The id as a string, then the values as a tag with nothing in between: a server reads
+-        // the byte after the id as the type of the tag, so a presence flag there breaks it.
++        // The id as a string, then a length, then the tag's bytes: no values is a length of one
++        // and an End byte (vanilla's lengthPrefixed(optionalTag)).
+         let mut w = Writer::new();
+         CustomClickAction::write(
+             &CustomClickAction {
+@@ -233,7 +237,7 @@ mod tests {
+             },
+             &mut w,
+         );
+-        assert_eq!(w.data, [3, b'a', b':', b'b', 0], "no values: one End byte");
++        assert_eq!(w.data, [3, b'a', b':', b'b', 1, 0], "no values");
+         let mut w = Writer::new();
+         CustomClickAction::write(
+             &CustomClickAction {
+@@ -242,14 +246,15 @@ mod tests {
+             },
+             &mut w,
+         );
++        // The id, the length of the tag's bytes (9), a compound with no name, "k": "v", its end.
++        let expected: [u8; 14] = [3, b'a', b':', b'b', 9, 10, 8, 0, 1, b'k', 0, 1, b'v', 0];
++        assert_eq!(w.data, expected);
++        // It reads back, and a length that lies is refused.
++        let mut r = Reader::new(&w.data);
+         assert_eq!(
+-            w.data,
+-            [
+-                3, b'a', b':', b'b', // the id
+-                10,   // a compound, with no name
+-                8, 0, 1, b'k', 0, 1, b'v', // "k": "v"
+-                0,    // its end
+-            ]
++            CustomClickAction::read(&mut r).unwrap().payload,
++            Some(Tag::compound([("k", text("v"))]))
+         );
++        assert!(CustomClickAction::read(&mut Reader::new(&[1, b'a', 200, 1, 0])).is_err());
+     }
+ }
+-- 
+2.43.0
+
