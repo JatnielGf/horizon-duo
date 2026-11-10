@@ -5,7 +5,7 @@
 //! The shape of a dialog is in `Tag` form here; the client reads it (`horizon_client::dialog`).
 use crate::{
     Error, Result,
-    buf::{Codec, Ident, Nbt, Opt, Reader, Writer},
+    buf::{Codec, Ident, Reader, Writer},
     packet,
 };
 use horizon_world::nbt::Tag;
@@ -92,10 +92,26 @@ packet!(
     /// ClientboundShowDialogPacket (configuration and play).
     ShowDialog { dialog: DialogRef => HolderDialog }
 );
+/// `ByteBufCodecs.optionalTagCodec`: a tag, or one `End` byte for none. There is no presence flag
+/// in front, unlike `ByteBufCodecs.optional`; a server reads a flag as the type of the tag.
+pub struct OptionalTag;
+
+impl Codec<Option<Tag>> for OptionalTag {
+    fn read(r: &mut Reader) -> Result<Option<Tag>> {
+        Ok(match r.nbt()? {
+            Tag::End => None,
+            tag => Some(tag),
+        })
+    }
+    fn write(v: &Option<Tag>, w: &mut Writer) {
+        w.nbt(v.as_ref().unwrap_or(&Tag::End));
+    }
+}
+
 packet!(
     /// ServerboundCustomClickActionPacket (configuration and play): the id of a button's custom
     /// action, with the values of the dialog's inputs (or the action's own payload).
-    CustomClickAction { id: String => Ident, payload: Option<Tag> => Opt<Nbt> }
+    CustomClickAction { id: String => Ident, payload: Option<Tag> => OptionalTag }
 );
 
 #[cfg(test)]
@@ -201,8 +217,39 @@ mod tests {
         };
         let mut w = Writer::new();
         CustomClickAction::write(&none, &mut w);
-        assert_eq!(*w.data.last().unwrap(), 0);
         let mut r = Reader::new(&w.data);
         assert_eq!(CustomClickAction::read(&mut r).unwrap(), none);
+    }
+
+    #[test]
+    fn the_answer_is_laid_out_the_way_a_server_reads_it() {
+        // The id as a string, then the values as a tag with nothing in between: a server reads
+        // the byte after the id as the type of the tag, so a presence flag there breaks it.
+        let mut w = Writer::new();
+        CustomClickAction::write(
+            &CustomClickAction {
+                id: "a:b".into(),
+                payload: None,
+            },
+            &mut w,
+        );
+        assert_eq!(w.data, [3, b'a', b':', b'b', 0], "no values: one End byte");
+        let mut w = Writer::new();
+        CustomClickAction::write(
+            &CustomClickAction {
+                id: "a:b".into(),
+                payload: Some(Tag::compound([("k", text("v"))])),
+            },
+            &mut w,
+        );
+        assert_eq!(
+            w.data,
+            [
+                3, b'a', b':', b'b', // the id
+                10,   // a compound, with no name
+                8, 0, 1, b'k', 0, 1, b'v', // "k": "v"
+                0,    // its end
+            ]
+        );
     }
 }
