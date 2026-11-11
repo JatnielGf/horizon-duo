@@ -207,6 +207,9 @@ pub mod error;
 mod cursor;
 pub mod event;
 pub mod event_loop;
+// USB HID keys, for iOS' hardware keyboards; built everywhere so it is tested everywhere.
+#[cfg(any(target_os = "ios", test))]
+mod hid;
 mod icon;
 pub mod keyboard;
 pub mod monitor;

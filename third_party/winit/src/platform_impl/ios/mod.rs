@@ -2,6 +2,7 @@
 
 mod app_state;
 mod event_loop;
+mod game_input;
 mod monitor;
 mod notification_center;
 mod view;

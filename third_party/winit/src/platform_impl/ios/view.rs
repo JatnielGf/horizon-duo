@@ -491,6 +491,21 @@ impl WinitView {
         (**self).window().map(|window| unsafe { Retained::cast(window) })
     }
 
+    /// Sends a window event the way the view's own gestures do.
+    pub(crate) fn send_window_event(&self, event: WindowEvent) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let mtm = MainThreadMarker::new().unwrap();
+        app_state::handle_nonuser_event(
+            mtm,
+            EventWrapper::StaticEvent(Event::WindowEvent {
+                window_id: RootWindowId(window.id()),
+                event,
+            }),
+        );
+    }
+
     fn send_ime(&self, ime: Ime) {
         let Some(window) = self.window() else {
             return;

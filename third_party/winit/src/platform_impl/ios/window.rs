@@ -540,6 +540,7 @@ impl Window {
         };
 
         let view = WinitView::new(mtm, &window_attributes, frame);
+        super::game_input::attach(&view);
 
         let gl_or_metal_backed =
             view.isKindOfClass(class!(CAMetalLayer)) || view.isKindOfClass(class!(CAEAGLLayer));

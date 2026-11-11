@@ -406,6 +406,22 @@ features = [
     "NSSet",
 ]
 
+# A hardware keyboard, whether or not the view has the keyboard (and, later, a mouse).
+[target.'cfg(target_os = "ios")'.dependencies.objc2-game-controller]
+version = "0.2.2"
+default-features = false
+features = [
+    "std",
+    "block2",
+    "GCControllerButtonInput",
+    "GCControllerElement",
+    "GCDevice",
+    "GCKeyCodes",
+    "GCKeyboard",
+    "GCKeyboardInput",
+    "GCPhysicalInputProfile",
+]
+
 [target.'cfg(target_os = "ios")'.dependencies.objc2-ui-kit]
 version = "0.2.2"
 features = [
