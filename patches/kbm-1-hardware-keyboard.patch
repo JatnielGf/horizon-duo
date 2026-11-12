@@ -1,0 +1,663 @@
+From 2d41ef14fc6e45a4b27784c18d33b8cb72c74dfc Mon Sep 17 00:00:00 2001
+From: Jatniel <noreply@example.com>
+Date: Wed, 11 Nov 2026 21:48:33 +0000
+Subject: [PATCH] winit iOS: report a hardware keyboard's keys through
+ GameController
+
+UIKit gives key presses to the first responder, and the winit view is that only
+while a text field has the on-screen keyboard, so a keyboard folded to an iPad or
+paired to a phone reached the game with nothing while playing. GameController
+reports the keys of a connected keyboard whatever the view is doing.
+
+game_input.rs listens to GCKeyboard (the one connected now, and any connected
+later, with its keys let go when it leaves) and sends KeyboardInput with the
+physical key, the key on a US layout, its side, and ModifiersChanged. hid.rs holds
+the USB HID usage table (built and tested on every platform).
+
+Text stays the text system's: while the view has the keyboard UIKit sends what is
+typed as insertText and deleteBackward, so the keys that write text are left out
+then (a key event as well would write them twice), and a release is only sent for
+a press that was.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                                    |  14 +
+ third_party/winit/Cargo.toml                  |  16 +
+ third_party/winit/src/hid.rs                  | 342 ++++++++++++++++++
+ third_party/winit/src/lib.rs                  |   3 +
+ .../winit/src/platform_impl/ios/game_input.rs | 148 ++++++++
+ .../winit/src/platform_impl/ios/mod.rs        |   1 +
+ .../winit/src/platform_impl/ios/view.rs       |  15 +
+ .../winit/src/platform_impl/ios/window.rs     |   1 +
+ 8 files changed, 540 insertions(+)
+ create mode 100644 third_party/winit/src/hid.rs
+ create mode 100644 third_party/winit/src/platform_impl/ios/game_input.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2aa7186..d85e049 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2289,6 +2289,19 @@ dependencies = [
+  "objc2-core-foundation",
+ ]
+ 
++[[package]]
++name = "objc2-game-controller"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e04403ce18c0bc50a440c5af2d5df141ddf79a737f1acd8dcd77a0795ae30096"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2 0.5.1",
++ "objc2 0.5.3",
++ "objc2-app-kit 0.2.2",
++ "objc2-foundation 0.2.2",
++]
++
+ [[package]]
+ name = "objc2-io-kit"
+ version = "0.3.2"
+@@ -4773,6 +4786,7 @@ dependencies = [
+  "objc2 0.5.3",
+  "objc2-app-kit 0.2.2",
+  "objc2-foundation 0.2.2",
++ "objc2-game-controller",
+  "objc2-ui-kit",
+  "orbclient",
+  "percent-encoding",
+diff --git a/third_party/winit/Cargo.toml b/third_party/winit/Cargo.toml
+index 2bf91f0..940211d 100644
+--- a/third_party/winit/Cargo.toml
++++ b/third_party/winit/Cargo.toml
+@@ -406,6 +406,22 @@ features = [
+     "NSSet",
+ ]
+ 
++# A hardware keyboard, whether or not the view has the keyboard (and, later, a mouse).
++[target.'cfg(target_os = "ios")'.dependencies.objc2-game-controller]
++version = "0.2.2"
++default-features = false
++features = [
++    "std",
++    "block2",
++    "GCControllerButtonInput",
++    "GCControllerElement",
++    "GCDevice",
++    "GCKeyCodes",
++    "GCKeyboard",
++    "GCKeyboardInput",
++    "GCPhysicalInputProfile",
++]
++
+ [target.'cfg(target_os = "ios")'.dependencies.objc2-ui-kit]
+ version = "0.2.2"
+ features = [
+diff --git a/third_party/winit/src/hid.rs b/third_party/winit/src/hid.rs
+new file mode 100644
+index 0000000..deed75e
+--- /dev/null
++++ b/third_party/winit/src/hid.rs
+@@ -0,0 +1,342 @@
++//! USB HID keyboard usages (page 0x07) as winit's keys. iOS' GameController reports a hardware
++//! keyboard's keys by these numbers (`GCKeyCode`), and so does UIKit (`UIKeyboardHIDUsage`).
++//! Kept apart from the platform code so it is built, and tested, everywhere.
++#![cfg_attr(not(target_os = "ios"), allow(dead_code))]
++
++use smol_str::SmolStr;
++
++use crate::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKey};
++
++/// The physical key with this HID usage, if winit has one.
++pub(crate) fn key_code(usage: u32) -> Option<KeyCode> {
++    use KeyCode::*;
++    const LETTERS: [KeyCode; 26] = [
++        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO,
++        KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
++    ];
++    const DIGITS: [KeyCode; 10] = [
++        Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, Digit0,
++    ];
++    const FUNCTION: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
++    const FUNCTION_HIGH: [KeyCode; 12] =
++        [F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24];
++    const PAD: [KeyCode; 10] = [
++        Numpad1, Numpad2, Numpad3, Numpad4, Numpad5, Numpad6, Numpad7, Numpad8, Numpad9, Numpad0,
++    ];
++    Some(match usage {
++        0x04..=0x1D => LETTERS[(usage - 0x04) as usize],
++        0x1E..=0x27 => DIGITS[(usage - 0x1E) as usize],
++        0x28 => Enter,
++        0x29 => Escape,
++        0x2A => Backspace,
++        0x2B => Tab,
++        0x2C => Space,
++        0x2D => Minus,
++        0x2E => Equal,
++        0x2F => BracketLeft,
++        0x30 => BracketRight,
++        // The key beside Enter on an ISO keyboard sits where ANSI has the backslash.
++        0x31 | 0x32 => Backslash,
++        0x33 => Semicolon,
++        0x34 => Quote,
++        0x35 => Backquote,
++        0x36 => Comma,
++        0x37 => Period,
++        0x38 => Slash,
++        0x39 => CapsLock,
++        0x3A..=0x45 => FUNCTION[(usage - 0x3A) as usize],
++        0x46 => PrintScreen,
++        0x47 => ScrollLock,
++        0x48 => Pause,
++        0x49 => Insert,
++        0x4A => Home,
++        0x4B => PageUp,
++        0x4C => Delete,
++        0x4D => End,
++        0x4E => PageDown,
++        0x4F => ArrowRight,
++        0x50 => ArrowLeft,
++        0x51 => ArrowDown,
++        0x52 => ArrowUp,
++        0x53 => NumLock,
++        0x54 => NumpadDivide,
++        0x55 => NumpadMultiply,
++        0x56 => NumpadSubtract,
++        0x57 => NumpadAdd,
++        0x58 => NumpadEnter,
++        0x59..=0x62 => PAD[(usage - 0x59) as usize],
++        0x63 => NumpadDecimal,
++        0x64 => IntlBackslash,
++        0x65 => ContextMenu,
++        0x67 => NumpadEqual,
++        0x68..=0x73 => FUNCTION_HIGH[(usage - 0x68) as usize],
++        0xE0 => ControlLeft,
++        0xE1 => ShiftLeft,
++        0xE2 => AltLeft,
++        0xE3 => SuperLeft,
++        0xE4 => ControlRight,
++        0xE5 => ShiftRight,
++        0xE6 => AltRight,
++        0xE7 => SuperRight,
++        _ => return None,
++    })
++}
++
++/// Whether the system's text input takes this key when a text field has the keyboard (typing,
++/// Return and Backspace reach the app as `insertText` and `deleteBackward`), so a key event for
++/// it would write the same thing twice.
++pub(crate) fn is_text_key(code: KeyCode) -> bool {
++    use KeyCode::*;
++    matches!(
++        code,
++        KeyA | KeyB | KeyC | KeyD | KeyE | KeyF | KeyG | KeyH | KeyI | KeyJ | KeyK | KeyL
++            | KeyM | KeyN | KeyO | KeyP | KeyQ | KeyR | KeyS | KeyT | KeyU | KeyV | KeyW | KeyX
++            | KeyY | KeyZ | Digit0 | Digit1 | Digit2 | Digit3 | Digit4 | Digit5 | Digit6
++            | Digit7 | Digit8 | Digit9 | Space | Enter | Backspace | Minus | Equal
++            | BracketLeft | BracketRight | Backslash | Semicolon | Quote | Backquote | Comma
++            | Period | Slash | IntlBackslash | NumpadEnter | NumpadDivide | NumpadMultiply
++            | NumpadSubtract | NumpadAdd | NumpadDecimal | NumpadEqual | Numpad0 | Numpad1
++            | Numpad2 | Numpad3 | Numpad4 | Numpad5 | Numpad6 | Numpad7 | Numpad8 | Numpad9
++    )
++}
++
++/// Where on the keyboard the key is.
++pub(crate) fn location(code: KeyCode) -> KeyLocation {
++    use KeyCode::*;
++    match code {
++        ControlLeft | ShiftLeft | AltLeft | SuperLeft => KeyLocation::Left,
++        ControlRight | ShiftRight | AltRight | SuperRight => KeyLocation::Right,
++        NumLock | NumpadDivide | NumpadMultiply | NumpadSubtract | NumpadAdd | NumpadEnter
++        | NumpadDecimal | NumpadEqual | Numpad0 | Numpad1 | Numpad2 | Numpad3 | Numpad4
++        | Numpad5 | Numpad6 | Numpad7 | Numpad8 | Numpad9 => KeyLocation::Numpad,
++        _ => KeyLocation::Standard,
++    }
++}
++
++/// What the key means, on a US layout (the layout a hardware keyboard's keys are named for).
++pub(crate) fn logical_key(code: KeyCode, shift: bool) -> Key {
++    use KeyCode::*;
++    let character = |plain: &str, shifted: &str| {
++        Key::Character(SmolStr::new(if shift { shifted } else { plain }))
++    };
++    let named = Key::Named;
++    match code {
++        KeyA => character("a", "A"),
++        KeyB => character("b", "B"),
++        KeyC => character("c", "C"),
++        KeyD => character("d", "D"),
++        KeyE => character("e", "E"),
++        KeyF => character("f", "F"),
++        KeyG => character("g", "G"),
++        KeyH => character("h", "H"),
++        KeyI => character("i", "I"),
++        KeyJ => character("j", "J"),
++        KeyK => character("k", "K"),
++        KeyL => character("l", "L"),
++        KeyM => character("m", "M"),
++        KeyN => character("n", "N"),
++        KeyO => character("o", "O"),
++        KeyP => character("p", "P"),
++        KeyQ => character("q", "Q"),
++        KeyR => character("r", "R"),
++        KeyS => character("s", "S"),
++        KeyT => character("t", "T"),
++        KeyU => character("u", "U"),
++        KeyV => character("v", "V"),
++        KeyW => character("w", "W"),
++        KeyX => character("x", "X"),
++        KeyY => character("y", "Y"),
++        KeyZ => character("z", "Z"),
++        Digit1 => character("1", "!"),
++        Digit2 => character("2", "@"),
++        Digit3 => character("3", "#"),
++        Digit4 => character("4", "$"),
++        Digit5 => character("5", "%"),
++        Digit6 => character("6", "^"),
++        Digit7 => character("7", "&"),
++        Digit8 => character("8", "*"),
++        Digit9 => character("9", "("),
++        Digit0 => character("0", ")"),
++        Minus => character("-", "_"),
++        Equal => character("=", "+"),
++        BracketLeft => character("[", "{"),
++        BracketRight => character("]", "}"),
++        Backslash | IntlBackslash => character("\\", "|"),
++        Semicolon => character(";", ":"),
++        Quote => character("'", "\""),
++        Backquote => character("`", "~"),
++        Comma => character(",", "<"),
++        Period => character(".", ">"),
++        Slash => character("/", "?"),
++        Numpad0 => character("0", "0"),
++        Numpad1 => character("1", "1"),
++        Numpad2 => character("2", "2"),
++        Numpad3 => character("3", "3"),
++        Numpad4 => character("4", "4"),
++        Numpad5 => character("5", "5"),
++        Numpad6 => character("6", "6"),
++        Numpad7 => character("7", "7"),
++        Numpad8 => character("8", "8"),
++        Numpad9 => character("9", "9"),
++        NumpadAdd => character("+", "+"),
++        NumpadSubtract => character("-", "-"),
++        NumpadMultiply => character("*", "*"),
++        NumpadDivide => character("/", "/"),
++        NumpadDecimal => character(".", "."),
++        NumpadEqual => character("=", "="),
++        Space => named(NamedKey::Space),
++        Enter | NumpadEnter => named(NamedKey::Enter),
++        Escape => named(NamedKey::Escape),
++        Backspace => named(NamedKey::Backspace),
++        Tab => named(NamedKey::Tab),
++        Delete => named(NamedKey::Delete),
++        Insert => named(NamedKey::Insert),
++        Home => named(NamedKey::Home),
++        End => named(NamedKey::End),
++        PageUp => named(NamedKey::PageUp),
++        PageDown => named(NamedKey::PageDown),
++        ArrowUp => named(NamedKey::ArrowUp),
++        ArrowDown => named(NamedKey::ArrowDown),
++        ArrowLeft => named(NamedKey::ArrowLeft),
++        ArrowRight => named(NamedKey::ArrowRight),
++        CapsLock => named(NamedKey::CapsLock),
++        NumLock => named(NamedKey::NumLock),
++        ScrollLock => named(NamedKey::ScrollLock),
++        PrintScreen => named(NamedKey::PrintScreen),
++        Pause => named(NamedKey::Pause),
++        ContextMenu => named(NamedKey::ContextMenu),
++        F1 => named(NamedKey::F1),
++        F2 => named(NamedKey::F2),
++        F3 => named(NamedKey::F3),
++        F4 => named(NamedKey::F4),
++        F5 => named(NamedKey::F5),
++        F6 => named(NamedKey::F6),
++        F7 => named(NamedKey::F7),
++        F8 => named(NamedKey::F8),
++        F9 => named(NamedKey::F9),
++        F10 => named(NamedKey::F10),
++        F11 => named(NamedKey::F11),
++        F12 => named(NamedKey::F12),
++        F13 => named(NamedKey::F13),
++        F14 => named(NamedKey::F14),
++        F15 => named(NamedKey::F15),
++        F16 => named(NamedKey::F16),
++        F17 => named(NamedKey::F17),
++        F18 => named(NamedKey::F18),
++        F19 => named(NamedKey::F19),
++        F20 => named(NamedKey::F20),
++        F21 => named(NamedKey::F21),
++        F22 => named(NamedKey::F22),
++        F23 => named(NamedKey::F23),
++        F24 => named(NamedKey::F24),
++        ShiftLeft | ShiftRight => named(NamedKey::Shift),
++        ControlLeft | ControlRight => named(NamedKey::Control),
++        AltLeft | AltRight => named(NamedKey::Alt),
++        SuperLeft | SuperRight => named(NamedKey::Super),
++        _ => Key::Unidentified(NativeKey::Unidentified),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn letters_digits_and_the_keys_around_them_have_their_usages() {
++        assert_eq!(key_code(0x04), Some(KeyCode::KeyA));
++        assert_eq!(key_code(0x1A), Some(KeyCode::KeyW));
++        assert_eq!(key_code(0x1D), Some(KeyCode::KeyZ));
++        assert_eq!(key_code(0x1E), Some(KeyCode::Digit1));
++        assert_eq!(key_code(0x26), Some(KeyCode::Digit9));
++        assert_eq!(key_code(0x27), Some(KeyCode::Digit0));
++        assert_eq!(key_code(0x28), Some(KeyCode::Enter));
++        assert_eq!(key_code(0x29), Some(KeyCode::Escape));
++        assert_eq!(key_code(0x2A), Some(KeyCode::Backspace));
++        assert_eq!(key_code(0x2B), Some(KeyCode::Tab));
++        assert_eq!(key_code(0x2C), Some(KeyCode::Space));
++        assert_eq!(key_code(0x35), Some(KeyCode::Backquote));
++    }
++
++    #[test]
++    fn function_arrow_numpad_and_modifier_keys_are_found() {
++        assert_eq!(key_code(0x3A), Some(KeyCode::F1));
++        assert_eq!(key_code(0x45), Some(KeyCode::F12));
++        assert_eq!(key_code(0x68), Some(KeyCode::F13));
++        assert_eq!(key_code(0x73), Some(KeyCode::F24));
++        assert_eq!(key_code(0x4F), Some(KeyCode::ArrowRight));
++        assert_eq!(key_code(0x50), Some(KeyCode::ArrowLeft));
++        assert_eq!(key_code(0x51), Some(KeyCode::ArrowDown));
++        assert_eq!(key_code(0x52), Some(KeyCode::ArrowUp));
++        assert_eq!(key_code(0x59), Some(KeyCode::Numpad1));
++        assert_eq!(key_code(0x62), Some(KeyCode::Numpad0));
++        assert_eq!(key_code(0x58), Some(KeyCode::NumpadEnter));
++        assert_eq!(key_code(0xE0), Some(KeyCode::ControlLeft));
++        assert_eq!(key_code(0xE1), Some(KeyCode::ShiftLeft));
++        assert_eq!(key_code(0xE2), Some(KeyCode::AltLeft));
++        assert_eq!(key_code(0xE3), Some(KeyCode::SuperLeft));
++        assert_eq!(key_code(0xE5), Some(KeyCode::ShiftRight));
++        assert_eq!(key_code(0xE7), Some(KeyCode::SuperRight));
++    }
++
++    #[test]
++    fn what_is_not_a_key_is_not_found() {
++        for usage in [0, 1, 2, 3, 0x66, 0x74, 0xAF, 0xE8, 0xFFFF] {
++            assert_eq!(key_code(usage), None, "{usage:#x}");
++        }
++    }
++
++    #[test]
++    fn every_usage_in_the_ranges_maps_to_a_different_key() {
++        let mut seen = std::collections::HashSet::new();
++        for usage in 0x04..=0x73u32 {
++            if let Some(code) = key_code(usage) {
++                // 0x31 and 0x32 are both the backslash position on different keyboards.
++                if usage != 0x32 {
++                    assert!(seen.insert(code), "{usage:#x} repeats {code:?}");
++                }
++            }
++        }
++        assert!(seen.len() > 100);
++    }
++
++    #[test]
++    fn the_text_system_keeps_what_it_types_and_the_game_keeps_the_rest() {
++        for code in [KeyCode::KeyW, KeyCode::Digit5, KeyCode::Space, KeyCode::Enter, KeyCode::Backspace, KeyCode::Comma] {
++            assert!(is_text_key(code), "{code:?}");
++        }
++        for code in [
++            KeyCode::Escape,
++            KeyCode::Tab,
++            KeyCode::ArrowUp,
++            KeyCode::F3,
++            KeyCode::ShiftLeft,
++            KeyCode::ControlLeft,
++            KeyCode::Delete,
++            KeyCode::CapsLock,
++        ] {
++            assert!(!is_text_key(code), "{code:?}");
++        }
++    }
++
++    #[test]
++    fn keys_mean_what_they_say_on_a_us_layout() {
++        assert_eq!(logical_key(KeyCode::KeyA, false), Key::Character("a".into()));
++        assert_eq!(logical_key(KeyCode::KeyA, true), Key::Character("A".into()));
++        assert_eq!(logical_key(KeyCode::Digit1, true), Key::Character("!".into()));
++        assert_eq!(logical_key(KeyCode::Slash, true), Key::Character("?".into()));
++        assert_eq!(logical_key(KeyCode::Numpad7, true), Key::Character("7".into()));
++        assert_eq!(logical_key(KeyCode::Escape, false), Key::Named(NamedKey::Escape));
++        assert_eq!(logical_key(KeyCode::Space, false), Key::Named(NamedKey::Space));
++        assert_eq!(logical_key(KeyCode::ShiftRight, false), Key::Named(NamedKey::Shift));
++        assert_eq!(logical_key(KeyCode::F11, false), Key::Named(NamedKey::F11));
++        assert!(matches!(logical_key(KeyCode::Lang1, false), Key::Unidentified(_)));
++    }
++
++    #[test]
++    fn modifiers_and_the_numpad_have_a_side() {
++        assert_eq!(location(KeyCode::ShiftLeft), KeyLocation::Left);
++        assert_eq!(location(KeyCode::AltRight), KeyLocation::Right);
++        assert_eq!(location(KeyCode::Numpad3), KeyLocation::Numpad);
++        assert_eq!(location(KeyCode::KeyQ), KeyLocation::Standard);
++    }
++}
+diff --git a/third_party/winit/src/lib.rs b/third_party/winit/src/lib.rs
+index 41a55b2..60ae4e8 100644
+--- a/third_party/winit/src/lib.rs
++++ b/third_party/winit/src/lib.rs
+@@ -207,6 +207,9 @@ pub mod error;
+ mod cursor;
+ pub mod event;
+ pub mod event_loop;
++// USB HID keys, for iOS' hardware keyboards; built everywhere so it is tested everywhere.
++#[cfg(any(target_os = "ios", test))]
++mod hid;
+ mod icon;
+ pub mod keyboard;
+ pub mod monitor;
+diff --git a/third_party/winit/src/platform_impl/ios/game_input.rs b/third_party/winit/src/platform_impl/ios/game_input.rs
+new file mode 100644
+index 0000000..d9e87ca
+--- /dev/null
++++ b/third_party/winit/src/platform_impl/ios/game_input.rs
+@@ -0,0 +1,148 @@
++//! A hardware keyboard, through GameController. UIKit hands key presses to the first responder,
++//! and the view is that only while a text field has the keyboard; GameController reports the
++//! keys of a keyboard that is plugged in, paired or (on an iPad) folded to it whatever the view
++//! is doing, which is what a game needs.
++//!
++//! Text is not this module's: while the view has the keyboard, UIKit sends what is typed as
++//! `insertText` and `deleteBackward`, so the keys that write text are left out then (see
++//! `hid::is_text_key`) and every other key still reaches the app.
++use std::cell::RefCell;
++use std::collections::HashSet;
++use std::ptr::NonNull;
++use std::rc::Rc;
++
++use block2::RcBlock;
++use objc2::rc::Retained;
++use objc2::runtime::Bool;
++use objc2_foundation::{MainThreadMarker, NSNotificationCenter};
++use objc2_game_controller::{
++    GCControllerButtonInput, GCKeyboard, GCKeyboardDidConnectNotification,
++    GCKeyboardDidDisconnectNotification, GCKeyboardInput,
++};
++
++use super::notification_center::create_observer;
++use super::view::WinitView;
++use crate::event::{ElementState, KeyEvent, Modifiers, WindowEvent};
++use crate::hid;
++use crate::keyboard::{ModifiersState, PhysicalKey};
++use crate::platform_impl::platform::DEVICE_ID;
++use crate::platform_impl::KeyEventExtra;
++
++/// The keys the app has been told are down, by their HID usage.
++#[derive(Default)]
++struct Keys {
++    down: HashSet<isize>,
++    modifiers: ModifiersState,
++}
++
++impl Keys {
++    /// The modifiers the keys that are down add up to.
++    fn modifiers_down(&self) -> ModifiersState {
++        let has = |usages: [isize; 2]| usages.iter().any(|u| self.down.contains(u));
++        let mut state = ModifiersState::empty();
++        state.set(ModifiersState::CONTROL, has([0xE0, 0xE4]));
++        state.set(ModifiersState::SHIFT, has([0xE1, 0xE5]));
++        state.set(ModifiersState::ALT, has([0xE2, 0xE6]));
++        state.set(ModifiersState::SUPER, has([0xE3, 0xE7]));
++        state
++    }
++}
++
++/// Starts listening to the hardware keyboard for `view`: the one connected now, and any that
++/// connects later.
++pub(crate) fn attach(view: &Retained<WinitView>) {
++    let keys = Rc::new(RefCell::new(Keys::default()));
++    connect(view, &keys);
++
++    let center = unsafe { NSNotificationCenter::defaultCenter() };
++    let (connecting, shared) = (view.clone(), keys.clone());
++    let connected = create_observer(&center, unsafe { GCKeyboardDidConnectNotification }, move |_| {
++        connect(&connecting, &shared)
++    });
++    // A keyboard that goes away takes its releases with it: the keys it had down are let go.
++    let (leaving, shared) = (view.clone(), keys);
++    let disconnected = create_observer(
++        &center,
++        unsafe { GCKeyboardDidDisconnectNotification },
++        move |_| release_all(&leaving, &shared),
++    );
++    // The observers last as long as the app does.
++    std::mem::forget(connected);
++    std::mem::forget(disconnected);
++}
++
++fn connect(view: &Retained<WinitView>, keys: &Rc<RefCell<Keys>>) {
++    let Some(input) = (unsafe { GCKeyboard::coalescedKeyboard() })
++        .and_then(|keyboard| unsafe { keyboard.keyboardInput() })
++    else {
++        return;
++    };
++    let (view, keys) = (view.clone(), keys.clone());
++    let handler = RcBlock::new(
++        move |_input: NonNull<GCKeyboardInput>,
++              _key: NonNull<GCControllerButtonInput>,
++              usage: isize,
++              pressed: Bool| {
++            key_changed(&view, &keys, usage, pressed.as_bool());
++        },
++    );
++    // GameController copies the block, so this one may go.
++    unsafe { input.setKeyChangedHandler(&*handler as *const _ as *mut _) };
++}
++
++fn key_changed(view: &WinitView, keys: &RefCell<Keys>, usage: isize, pressed: bool) {
++    // GameController calls the handlers on the main queue unless told otherwise; the app's
++    // events are the main thread's, so a key from anywhere else is dropped, not mishandled.
++    if MainThreadMarker::new().is_none() {
++        tracing::warn!("a hardware key arrived off the main thread and was dropped");
++        return;
++    }
++    let Some(code) = u32::try_from(usage).ok().and_then(hid::key_code) else {
++        return;
++    };
++    let (modifiers_changed, shift) = {
++        let mut keys = keys.borrow_mut();
++        if pressed {
++            // A key already down is not pressed again, and while the view takes text the keys
++            // that write it are the text system's.
++            if keys.down.contains(&usage)
++                || (hid::is_text_key(code) && unsafe { view.isFirstResponder() })
++            {
++                return;
++            }
++            keys.down.insert(usage);
++        } else if !keys.down.remove(&usage) {
++            // Its press was not passed on, so its release is not either.
++            return;
++        }
++        let now = keys.modifiers_down();
++        let changed = (now != keys.modifiers).then_some(now);
++        keys.modifiers = now;
++        (changed, now.contains(ModifiersState::SHIFT))
++    };
++    let state = if pressed { ElementState::Pressed } else { ElementState::Released };
++    if let Some(state) = modifiers_changed {
++        view.send_window_event(WindowEvent::ModifiersChanged(Modifiers::from(state)));
++    }
++    view.send_window_event(WindowEvent::KeyboardInput {
++        device_id: DEVICE_ID,
++        event: KeyEvent {
++            physical_key: PhysicalKey::Code(code),
++            logical_key: hid::logical_key(code, shift),
++            text: None,
++            location: hid::location(code),
++            state,
++            repeat: false,
++            platform_specific: KeyEventExtra {},
++        },
++        is_synthetic: false,
++    });
++}
++
++/// Lets go of every key the app was told is down.
++fn release_all(view: &WinitView, keys: &RefCell<Keys>) {
++    let down: Vec<isize> = keys.borrow().down.iter().copied().collect();
++    for usage in down {
++        key_changed(view, keys, usage, false);
++    }
++}
+diff --git a/third_party/winit/src/platform_impl/ios/mod.rs b/third_party/winit/src/platform_impl/ios/mod.rs
+index 69e79c9..3b8b46a 100644
+--- a/third_party/winit/src/platform_impl/ios/mod.rs
++++ b/third_party/winit/src/platform_impl/ios/mod.rs
+@@ -2,6 +2,7 @@
+ 
+ mod app_state;
+ mod event_loop;
++mod game_input;
+ mod monitor;
+ mod notification_center;
+ mod view;
+diff --git a/third_party/winit/src/platform_impl/ios/view.rs b/third_party/winit/src/platform_impl/ios/view.rs
+index 186a8ca..5988c7a 100644
+--- a/third_party/winit/src/platform_impl/ios/view.rs
++++ b/third_party/winit/src/platform_impl/ios/view.rs
+@@ -491,6 +491,21 @@ impl WinitView {
+         (**self).window().map(|window| unsafe { Retained::cast(window) })
+     }
+ 
++    /// Sends a window event the way the view's own gestures do.
++    pub(crate) fn send_window_event(&self, event: WindowEvent) {
++        let Some(window) = self.window() else {
++            return;
++        };
++        let mtm = MainThreadMarker::new().unwrap();
++        app_state::handle_nonuser_event(
++            mtm,
++            EventWrapper::StaticEvent(Event::WindowEvent {
++                window_id: RootWindowId(window.id()),
++                event,
++            }),
++        );
++    }
++
+     fn send_ime(&self, ime: Ime) {
+         let Some(window) = self.window() else {
+             return;
+diff --git a/third_party/winit/src/platform_impl/ios/window.rs b/third_party/winit/src/platform_impl/ios/window.rs
+index 48d2202..c92fad9 100644
+--- a/third_party/winit/src/platform_impl/ios/window.rs
++++ b/third_party/winit/src/platform_impl/ios/window.rs
+@@ -540,6 +540,7 @@ impl Window {
+         };
+ 
+         let view = WinitView::new(mtm, &window_attributes, frame);
++        super::game_input::attach(&view);
+ 
+         let gl_or_metal_backed =
+             view.isKindOfClass(class!(CAMetalLayer)) || view.isKindOfClass(class!(CAEAGLLayer));
+-- 
+2.43.0
+
